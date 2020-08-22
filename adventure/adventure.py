@@ -7,73 +7,65 @@ import os
 import random
 import re
 import time
-from collections import namedtuple
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from math import ceil
+from operator import itemgetter
 from types import SimpleNamespace
-from typing import List, Optional, Union, MutableMapping
+from typing import List, Literal, MutableMapping, Optional, Union
 
 import discord
+from beautifultable import ALIGN_LEFT, BeautifulTable
 from discord.ext.commands import CheckFailure
 from discord.ext.commands.errors import BadArgument
-from redbot.core import Config, bank, checks, commands
+from redbot.core import Config, commands
 from redbot.core.bot import Red
-from redbot.core.commands import Context
+from redbot.core.commands import check, get_dict_converter
 from redbot.core.data_manager import bundled_data_path, cog_data_path
 from redbot.core.errors import BalanceTooHigh
 from redbot.core.i18n import Translator, cog_i18n
-from redbot.core.utils.chat_formatting import (
-    box,
-    escape,
-    humanize_list,
-    humanize_timedelta,
-    pagify,
-)
+from redbot.core.utils import AsyncIter
+from redbot.core.utils.chat_formatting import box, escape, humanize_list, humanize_number, humanize_timedelta, pagify
 from redbot.core.utils.common_filters import filter_various_mentions
 from redbot.core.utils.menus import DEFAULT_CONTROLS, menu, start_adding_reactions
 from redbot.core.utils.predicates import MessagePredicate, ReactionPredicate
 
 import adventure.charsheet
-
+from . import bank
 from .charsheet import (
+    DEV_LIST,
+    ORDER,
+    RARITIES,
+    BackpackFilterParser,
     Character,
+    DayConverter,
+    EquipableItemConverter,
+    EquipmentConverter,
     GameSession,
     Item,
     ItemConverter,
-    EquipmentConverter,
+    ItemsConverter,
+    PercentageConverter,
+    RarityConverter,
+    SlotConverter,
     Stats,
+    ThemeSetMonterConverter,
+    ThemeSetPetConverter,
     calculate_sp,
     can_equip,
     equip_level,
     has_funds,
+    no_dev_prompt,
     parse_timedelta,
-    DEV_LIST,
-    RARITIES,
-    ORDER,
-    RarityConverter,
-    SlotConverter,
-    ThemeSetMonterConverter,
-    ThemeSetPetConverter,
 )
-
-try:
-    from redbot.core.utils.chat_formatting import humanize_number
-except ImportError:
-
-    def humanize_number(val: int) -> str:
-        if isinstance(val, int):
-            return "{:,}".format(val)
-        return f"{val}"
-
-
-try:
-    from redbot.core.bank import get_max_balance
-except ImportError:
-    from redbot.core.bank import MAX_BALANCE
-
-    async def get_max_balance(guild: discord.Guild = None) -> int:
-        return MAX_BALANCE
-
-BaseCog = getattr(commands, "Cog", object)
+from .menus import (
+    BaseMenu,
+    LeaderboardMenu,
+    LeaderboardSource,
+    NVScoreboardSource,
+    ScoreBoardMenu,
+    ScoreboardSource,
+    WeeklyScoreboardSource,
+)
 
 _ = Translator("Adventure", __file__)
 
@@ -81,11 +73,12 @@ log = logging.getLogger("red.cogs.adventure")
 
 REBIRTH_LVL = 20
 REBIRTH_STEP = 10
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 4
 _config: Config = None
+TaxesConverter = get_dict_converter(delims=[" ", ",", ";"])
 
 
-async def smart_embed(ctx, message, success=None):
+async def smart_embed(ctx, message, success=None, image=None):
     if ctx.guild:
         use_embeds = await _config.guild(ctx.guild).embed()
     else:
@@ -98,7 +91,10 @@ async def smart_embed(ctx, message, success=None):
                 colour = discord.Colour.dark_red()
             else:
                 colour = await ctx.embed_colour()
-            return await ctx.send(embed=discord.Embed(description=message, color=colour))
+            embed = discord.Embed(description=message, color=colour)
+            if image:
+                embed.set_thumbnail(url=image)
+            return await ctx.send(embed=embed)
         else:
             return await ctx.send(message)
     return await ctx.send(message)
@@ -106,8 +102,8 @@ async def smart_embed(ctx, message, success=None):
 
 def check_global_setting_admin():
     """
-    Command decorator. If the bank is not global, it checks if the author is
-     either a bot admin or has the manage_guild permission.
+    Command decorator. If the bank is not global, it checks if the author is 
+    either a bot admin or has the manage_guild permission.
     """
 
     async def pred(ctx: commands.Context):
@@ -131,15 +127,23 @@ def check_global_setting_admin():
     return commands.check(pred)
 
 
+def has_separated_economy():
+    async def predicate(ctx):
+        if not (ctx.cog and getattr(ctx.cog, "_separate_economy", False)):
+            raise CheckFailure
+        return True
+
+    return check(predicate)
+
+
 class AdventureResults:
     """Object to store recent adventure results."""
 
     def __init__(self, num_raids):
-        """TODO: to be defined1. """
         self._num_raids = num_raids
         self._last_raids: MutableMapping[int, List] = {}
 
-    def add_result(self, ctx: Context, main_action, amount, num_ppl, success):
+    def add_result(self, ctx: commands.Context, main_action, amount, num_ppl, success):
         """Add result to this object.
         :main_action: Main damage action taken by the adventurers
             (highest amount dealt). Should be either "attack" or
@@ -159,7 +163,7 @@ class AdventureResults:
             raid_dict[var] = locals()[var]
         self._last_raids[ctx.guild.id].append(raid_dict)
 
-    def get_stat_range(self, ctx: Context):
+    def get_stat_range(self, ctx: commands.Context):
         """Return reasonable stat range for monster pool to have based
         on last few raids' damage.
 
@@ -180,43 +184,42 @@ class AdventureResults:
         num_talk = 0
         talk_amount = 0
         num_wins = 0
-        raids = self._last_raids.get(ctx.guild.id, [])
-        raid_count = len(raids)
-        for raid in raids:
-            if raid["main_action"] == "attack":
-                num_attack += 1
-                dmg_amount += raid["amount"]
-                if raid["num_ppl"] == 1:
-                    dmg_amount += raid["amount"] * SOLO_RAID_SCALE
-            else:
-                num_talk += 1
-                talk_amount += raid["amount"]
-                if raid["num_ppl"] == 1:
-                    talk_amount += raid["amount"] * SOLO_RAID_SCALE
-            log.debug(f"raid dmg: {raid['amount']}")
-            if raid["success"]:
-                num_wins += 1
-
-        # calculate relevant stats
-        if num_wins == 0:
-            num_wins = self._num_raids // 2
-        win_percent = num_wins / raid_count if raid_count else self._num_raids
         stat_type = "hp"
         avg_amount = 0
-        if num_attack > 0:
-            avg_amount = dmg_amount / num_attack
-        if dmg_amount < talk_amount:
-            stat_type = "dipl"
-            avg_amount = talk_amount / num_talk
-
-        # return main stat and range
-        min_stat = avg_amount * 0.75
-        max_stat = avg_amount * 2
-        # want win % to be at least 50%, even when solo
-        # if win % is below 50%, scale back min/max for easier mons
-        if win_percent < 0.5:
-            min_stat = avg_amount * win_percent
-            max_stat = avg_amount * 1.5
+        raids = self._last_raids.get(ctx.guild.id, [])
+        raid_count = len(raids)
+        if raid_count == 0:
+            num_wins = self._num_raids // 2
+            raid_count = self._num_raids
+            win_percent = 0.5
+        else:
+            for raid in raids:
+                if raid["main_action"] == "attack":
+                    num_attack += 1
+                    dmg_amount += raid["amount"]
+                    if raid["num_ppl"] == 1:
+                        dmg_amount += raid["amount"] * SOLO_RAID_SCALE
+                else:
+                    num_talk += 1
+                    talk_amount += raid["amount"]
+                    if raid["num_ppl"] == 1:
+                        talk_amount += raid["amount"] * SOLO_RAID_SCALE
+                log.debug(f"raid dmg: {raid['amount']}")
+                if raid["success"]:
+                    num_wins += 1
+            if num_attack > 0:
+                avg_amount = dmg_amount / num_attack
+            if dmg_amount < talk_amount:
+                stat_type = "dipl"
+                avg_amount = talk_amount / num_talk
+            win_percent = num_wins / raid_count
+            min_stat = avg_amount * 0.75
+            max_stat = avg_amount * 2
+            # want win % to be at least 50%, even when solo
+            # if win % is below 50%, scale back min/max for easier mons
+            if win_percent < 0.5:
+                min_stat = avg_amount * win_percent
+                max_stat = avg_amount * 1.5
 
         stats_dict = {}
         for var in ("stat_type", "min_stat", "max_stat", "win_percent"):
@@ -228,39 +231,46 @@ class AdventureResults:
 
 
 @cog_i18n(_)
-class Adventure(BaseCog):
+class Adventure(commands.Cog):
     """Adventure, derived from the Goblins Adventure cog by locastan."""
 
-    __version__ = "3.1.6"
+    async def red_delete_data_for_user(
+        self, *, requester: Literal["discord", "owner", "user", "user_strict"], user_id: int,
+    ):
+        await self.config.user_from_id(user_id).clear()
+        await bank._config.user_from_id(
+            user_id
+        ).clear()  # This will only ever touch the separate currency, leaving bot economy to be handled by core.
+
+    __version__ = "3.4.1"
 
     def __init__(self, bot: Red):
         self.bot = bot
+        bank._init(bot)
         self._last_trade = {}
-        self._adv_results = AdventureResults(10)
+        self._adv_results = AdventureResults(20)
         self.emojis = SimpleNamespace()
-        self.emojis.fumble = "\N{EXCLAMATION QUESTION MARK}"
+        self.emojis.fumble = "\N{EXCLAMATION QUESTION MARK}\N{VARIATION SELECTOR-16}"
         self.emojis.level_up = "\N{BLACK UP-POINTING DOUBLE TRIANGLE}"
         self.emojis.rebirth = "\N{BABY SYMBOL}"
-        self.emojis.attack = "\N{DAGGER KNIFE}"
+        self.emojis.attack = "\N{DAGGER KNIFE}\N{VARIATION SELECTOR-16}"
         self.emojis.magic = "\N{SPARKLES}"
-        self.emojis.talk = "\N{LEFT SPEECH BUBBLE}"
+        self.emojis.talk = "\N{LEFT SPEECH BUBBLE}\N{VARIATION SELECTOR-16}"
         self.emojis.pray = "\N{PERSON WITH FOLDED HANDS}"
-        self.emojis.run = "\N{RUNNER}"
+        self.emojis.run = "\N{RUNNER}\N{ZERO WIDTH JOINER}\N{MALE SIGN}\N{VARIATION SELECTOR-16}"
         self.emojis.crit = "\N{COLLISION SYMBOL}"
         self.emojis.magic_crit = "\N{HIGH VOLTAGE SIGN}"
-        self.emojis.berserk = "\N{RIGHT ANGER BUBBLE}"
+        self.emojis.berserk = "\N{RIGHT ANGER BUBBLE}\N{VARIATION SELECTOR-16}"
         self.emojis.dice = "\N{GAME DIE}"
         self.emojis.yes = "\N{WHITE HEAVY CHECK MARK}"
         self.emojis.no = "\N{NEGATIVE SQUARED CROSS MARK}"
         self.emojis.sell = "\N{MONEY BAG}"
         self.emojis.skills = SimpleNamespace()
         self.emojis.skills.bless = "\N{SCROLL}"
-        # self.emojis.skills.psychic = "\N{SIX POINTED STAR WITH MIDDLE DOT}"
+        self.emojis.skills.psychic = "\N{SIX POINTED STAR WITH MIDDLE DOT}"
         self.emojis.skills.berserker = self.emojis.berserk
         self.emojis.skills.wizzard = self.emojis.magic_crit
-        self.emojis.skills.bard = (
-            "\N{EIGHTH NOTE}\N{BEAMED EIGHTH NOTES}\N{BEAMED SIXTEENTH NOTES}"
-        )
+        self.emojis.skills.bard = "\N{EIGHTH NOTE}\N{BEAMED EIGHTH NOTES}\N{BEAMED SIXTEENTH NOTES}"
         self.emojis.hp = "\N{HEAVY BLACK HEART}\N{VARIATION SELECTOR-16}"
         self.emojis.dipl = self.emojis.talk
 
@@ -301,15 +311,19 @@ class Adventure(BaseCog):
 
         self._adventure_countdown = {}
         self._rewards = {}
+        self._reward_message = {}
         self._trader_countdown = {}
         self._current_traders = {}
         self._curent_trader_stock = {}
-        self._sessions = {}
+        self._sessions: MutableMapping[int, GameSession] = {}
         self._react_messaged = []
         self.tasks = {}
         self.locks: MutableMapping[int, asyncio.Lock] = {}
+        self.gb_task = None
 
         self.config = Config.get_conf(self, 2_710_801_001, force_registration=True)
+        self._daily_bonus = {}
+        self._separate_economy = None
 
         default_user = {
             "exp": 0,
@@ -318,7 +332,9 @@ class Adventure(BaseCog):
             "cha": 0,
             "int": 0,
             "last_skill_reset": 0,
-            "treasure": [0, 0, 0, 0, 0],
+            "last_known_currency": 0,
+            "last_currency_check": 0,
+            "treasure": [0, 0, 0, 0, 0, 0],
             "items": {
                 "head": {},
                 "neck": {},
@@ -334,13 +350,19 @@ class Adventure(BaseCog):
                 "backpack": {},
             },
             "loadouts": {},
-            "class": {
-                "name": _("Hero"),
-                "ability": False,
-                "desc": _("Your basic adventuring hero."),
-                "cooldown": 0,
-            },
+            "class": {"name": _("Hero"), "ability": False, "desc": _("Your basic adventuring hero."), "cooldown": 0,},
             "skill": {"pool": 0, "att": 0, "cha": 0, "int": 0},
+            "adventures": {
+                "wins": 0,
+                "loses": 0,
+                "fight": 0,
+                "spell": 0,
+                "talk": 0,
+                "pray": 0,
+                "run": 0,
+                "fumbles": 0,
+            },
+            "nega": {"wins": 0, "loses": 0, "xp__earnings": 0, "gold__losses": 0,},
         }
 
         default_guild = {
@@ -353,6 +375,8 @@ class Adventure(BaseCog):
             "cart_timeout": 10800,
             "cooldown_timer_manual": 120,
             "rebirth_cost": 100.0,
+            "disallow_withdraw": True,
+            "max_allowed_withdraw": 50000,
         }
         default_global = {
             "god_name": _("Herbert"),
@@ -365,6 +389,14 @@ class Adventure(BaseCog):
             "schema_version": 1,
             "rebirth_cost": 100.0,
             "themes": {},
+            "daily_bonus": {"1": 0, "2": 0, "3": 0.5, "4": 0, "5": 0.5, "6": 1.0, "7": 1.0},
+            "tax_brackets": {},
+            "separate_economy": True,
+            "to_conversion_rate": 10,
+            "from_conversion_rate": 11,
+            "max_allowed_withdraw": 50000,
+            "disallow_withdraw": False,
+            "easy_mode": False,
         }
         self.RAISINS: list = None
         self.THREATEE: list = None
@@ -384,10 +416,8 @@ class Adventure(BaseCog):
         self._init_task = self.bot.loop.create_task(self.initialize())
         self._ready_event = asyncio.Event()
 
-    async def cog_before_invoke(self, ctx: Context):
+    async def cog_before_invoke(self, ctx: commands.Context):
         await self._ready_event.wait()
-
-    async def cog_before_invoke(self, ctx: Context):
         if ctx.author.id in self.locks and self.locks[ctx.author.id].locked():
             raise CheckFailure(f"There's an active lock for this user ({ctx.author.id})")
         return True
@@ -398,24 +428,30 @@ class Adventure(BaseCog):
 
     async def initialize(self):
         """This will load all the bundled data into respective variables."""
-        await self.bot.wait_until_ready()
+        await self.bot.wait_until_red_ready()
         try:
             global _config
             _config = self.config
             theme = await self.config.theme()
-            as_monster_fp = cog_data_path(self) / f"{theme}" / "as_monsters.json"
-            attribs_fp = cog_data_path(self) / f"{theme}" / "attribs.json"
-            locations_fp = cog_data_path(self) / f"{theme}" / "locations.json"
-            monster_fp = cog_data_path(self) / f"{theme}" / "monsters.json"
-            pets_fp = cog_data_path(self) / f"{theme}" / "pets.json"
-            raisins_fp = cog_data_path(self) / f"{theme}" / "raisins.json"
-            threatee_fp = cog_data_path(self) / f"{theme}" / "threatee.json"
-            tr_set_fp = cog_data_path(self) / f"{theme}" / "tr_set.json"
-            prefixes_fp = cog_data_path(self) / f"{theme}" / "prefixes.json"
-            materials_fp = cog_data_path(self) / f"{theme}" / "materials.json"
-            equipment_fp = cog_data_path(self) / f"{theme}" / "equipment.json"
-            suffixes_fp = cog_data_path(self) / f"{theme}" / "suffixes.json"
-            set_bonuses = cog_data_path(self) / f"{theme}" / "set_bonuses.json"
+            self._separate_economy = await self.config.separate_economy()
+            if theme in {"default"}:
+                get_path = bundled_data_path
+            else:
+                get_path = cog_data_path
+
+            as_monster_fp = get_path(self) / f"{theme}" / "as_monsters.json"
+            attribs_fp = get_path(self) / f"{theme}" / "attribs.json"
+            locations_fp = get_path(self) / f"{theme}" / "locations.json"
+            monster_fp = get_path(self) / f"{theme}" / "monsters.json"
+            pets_fp = get_path(self) / f"{theme}" / "pets.json"
+            raisins_fp = get_path(self) / f"{theme}" / "raisins.json"
+            threatee_fp = get_path(self) / f"{theme}" / "threatee.json"
+            tr_set_fp = get_path(self) / f"{theme}" / "tr_set.json"
+            prefixes_fp = get_path(self) / f"{theme}" / "prefixes.json"
+            materials_fp = get_path(self) / f"{theme}" / "materials.json"
+            equipment_fp = get_path(self) / f"{theme}" / "equipment.json"
+            suffixes_fp = get_path(self) / f"{theme}" / "suffixes.json"
+            set_bonuses = get_path(self) / f"{theme}" / "set_bonuses.json"
             files = {
                 "pets": pets_fp,
                 "attr": attribs_fp,
@@ -488,13 +524,13 @@ class Adventure(BaseCog):
             adventure.charsheet.REBIRTH_LVL = REBIRTH_LVL
             adventure.charsheet.REBIRTH_STEP = REBIRTH_STEP
             adventure.charsheet.SET_BONUSES = self.SET_BONUSES
-            await self._migrate_config(
-                from_version=await self.config.schema_version(), to_version=_SCHEMA_VERSION
-            )
+            await self._migrate_config(from_version=await self.config.schema_version(), to_version=_SCHEMA_VERSION)
+            self._daily_bonus = await self.config.daily_bonus.all()
         except Exception as err:
             log.exception("There was an error starting up the cog", exc_info=err)
         else:
             self._ready_event.set()
+            self.gb_task = self.bot.loop.create_task(self._garbage_collection())
 
     async def cleanup_tasks(self):
         await self._ready_event.wait()
@@ -508,7 +544,6 @@ class Adventure(BaseCog):
             await asyncio.sleep(300)
 
     async def _migrate_config(self, from_version: int, to_version: int) -> None:
-        database_entries = []
         log.debug(f"from_version: {from_version} to_version:{to_version}")
         if from_version == to_version:
             return
@@ -523,21 +558,13 @@ class Adventure(BaseCog):
                     user_equipped_items = adventurers_data[user]["items"]
                     for slot in user_equipped_items.keys():
                         if user_equipped_items[slot]:
-                            for (slot_item_name, slot_item) in list(
-                                user_equipped_items[slot].items()
-                            )[:1]:
-                                new_name, slot_item = self._convert_item_migration(
-                                    slot_item_name, slot_item
-                                )
+                            for (slot_item_name, slot_item) in list(user_equipped_items[slot].items())[:1]:
+                                new_name, slot_item = self._convert_item_migration(slot_item_name, slot_item)
                                 adventurers_data[user]["items"][slot] = {new_name: slot_item}
                     if "backpack" not in adventurers_data[user]:
                         adventurers_data[user]["backpack"] = {}
-                    for (backpack_item_name, backpack_item) in adventurers_data[user][
-                        "backpack"
-                    ].items():
-                        new_name, backpack_item = self._convert_item_migration(
-                            backpack_item_name, backpack_item
-                        )
+                    for (backpack_item_name, backpack_item) in adventurers_data[user]["backpack"].items():
+                        new_name, backpack_item = self._convert_item_migration(backpack_item_name, backpack_item)
                         new_backpack[new_name] = backpack_item
                     adventurers_data[user]["backpack"] = new_backpack
                     if "loadouts" not in adventurers_data[user]:
@@ -555,7 +582,70 @@ class Adventure(BaseCog):
                         adventurers_data[user]["loadouts"] = new_loadout
                     except Exception:
                         adventurers_data[user]["loadouts"] = {}
-        await self.config.schema_version.set(to_version)
+            await self.config.schema_version.set(2)
+            from_version = 2
+        if from_version < 3 <= to_version:
+            group = self.config._get_base_group(self.config.USER)
+            accounts = await group.all()
+            tmp = accounts.copy()
+            async with group.all() as adventurers_data:
+                for user in tmp:
+                    new_loadout = {}
+                    if "loadouts" not in adventurers_data[user]:
+                        adventurers_data[user]["loadouts"] = {}
+                    try:
+                        for (loadout_name, loadout) in adventurers_data[user]["loadouts"].items():
+                            if loadout_name in {
+                                "head",
+                                "neck",
+                                "chest",
+                                "gloves",
+                                "belt",
+                                "legs",
+                                "boots",
+                                "left",
+                                "right",
+                                "ring",
+                                "charm",
+                            }:
+                                continue
+                            new_loadout[loadout_name] = loadout
+                        adventurers_data[user]["loadouts"] = new_loadout
+                    except Exception:
+                        adventurers_data[user]["loadouts"] = {}
+            await self.config.schema_version.set(3)
+
+        if from_version < 4 <= to_version:
+            group = self.config._get_base_group(self.config.USER)
+            accounts = await group.all()
+            tmp = accounts.copy()
+            async with group.all() as adventurers_data:
+                async for user in AsyncIter(tmp, steps=100):
+                    if "items" in tmp[user]:
+                        equipped = tmp[user]["items"]
+                        for slot, item in equipped.items():
+                            for item_name, item_data in item.items():
+                                if "King Solomos" in item_name:
+                                    del adventurers_data[user]["items"][slot][item_name]
+                                    item_name = item_name.replace("Solomos", "Solomons")
+                                    adventurers_data[user]["items"][slot][item_name] = item_data
+                    if "loadouts" in tmp[user]:
+                        loadout = tmp[user]["loadouts"]
+                        for loadout_name, loadout_data in loadout.items():
+                            for slot, item in equipped.items():
+                                for item_name, item_data in item.items():
+                                    if "King Solomos" in item_name:
+                                        del adventurers_data[user]["loadouts"][loadout_name][slot][item_name]
+                                        item_name = item_name.replace("Solomos", "Solomons")
+                                        adventurers_data[user]["loadouts"][loadout_name][slot][item_name] = item_data
+                    if "backpack" in tmp[user]:
+                        backpack = tmp[user]["backpack"]
+                        async for item_name, item_data in AsyncIter(backpack.items(), steps=100):
+                            if "King Solomos" in item_name:
+                                del adventurers_data[user]["backpack"][item_name]
+                                item_name = item_name.replace("Solomos", "Solomons")
+                                adventurers_data[user]["backpack"][item_name] = item_data
+            await self.config.schema_version.set(4)
 
     def _convert_item_migration(self, item_name, item_dict):
         new_name = item_name
@@ -564,9 +654,7 @@ class Adventure(BaseCog):
         if "rarity" not in item_dict:
             item_dict["rarity"] = "common"
         if item_dict["rarity"] == "legendary":
-            new_name = (
-                item_name.replace("{Legendary:'", "").replace("legendary:'", "").replace("'}", "")
-            )
+            new_name = item_name.replace("{Legendary:'", "").replace("legendary:'", "").replace("'}", "")
         if item_dict["rarity"] == "epic":
             new_name = item_name.replace("[", "").replace("]", "")
         if item_dict["rarity"] == "rare":
@@ -596,13 +684,7 @@ class Adventure(BaseCog):
             [
                 p.id
                 for _loop, session in self._sessions.items()
-                for p in [
-                    *session.fight,
-                    *session.magic,
-                    *session.pray,
-                    *session.talk,
-                    *session.run,
-                ]
+                for p in [*session.fight, *session.magic, *session.pray, *session.talk, *session.run,]
             ]
         )
         return bool(author.id in participants_ids)
@@ -613,7 +695,7 @@ class Adventure(BaseCog):
             return True
         return bool(ctx.guild is None and await bank.is_global())
 
-    def get_lock(self, member: discord.Member):
+    def get_lock(self, member: discord.User):
         if member.id not in self.locks:
             self.locks[member.id] = asyncio.Lock()
         return self.locks[member.id]
@@ -625,8 +707,10 @@ class Adventure(BaseCog):
     @commands.command()
     @commands.bot_has_permissions(add_reactions=True)
     @commands.is_owner()
-    async def makecart(self, ctx: Context):
-        """[Owner] Force a cart to appear."""
+    async def makecart(self, ctx: commands.Context):
+        """[Dev] Force a cart to appear."""
+        if not await no_dev_prompt(ctx):
+            return
         await self._trader(ctx, True)
 
     async def _genitem(self, rarity: str = None, slot: str = None):
@@ -637,8 +721,7 @@ class Adventure(BaseCog):
                 [
                     i
                     for i in items
-                    if i[1]["slot"] == [slot]
-                    or (slot == "two handed" and i[1]["slot"] == ["left", "right"])
+                    if i[1]["slot"] == [slot] or (slot == "two handed" and i[1]["slot"] == ["left", "right"])
                 ]
                 if slot
                 else items
@@ -648,14 +731,13 @@ class Adventure(BaseCog):
 
         RARE_INDEX = RARITIES.index("rare")
         EPIC_INDEX = RARITIES.index("epic")
-        PREFIX_CHANCE = {"rare": 0.5, "epic": 0.75, "legendary": 0.9, "set": 0}
-        SUFFIX_CHANCE = {"epic": 0.5, "legendary": 0.75}
+        PREFIX_CHANCE = {"rare": 0.5, "epic": 0.75, "legendary": 0.9, "ascended": 1.0, "set": 0}
+        SUFFIX_CHANCE = {"epic": 0.5, "legendary": 0.75, "ascended": 0.5}
 
         if rarity not in RARITIES:
             rarity = "normal"
         if slot is None:
             slot = random.choice(ORDER)
-            #  slot = random.choice(["right", "chest"])
         name = ""
         stats = {"att": 0, "cha": 0, "int": 0, "dex": 0, "luck": 0}
 
@@ -705,27 +787,26 @@ class Adventure(BaseCog):
 
     @commands.command()
     @commands.is_owner()
-    async def genitems(self, ctx: Context, rarity: str, slot: str, num: int = 1):
-        """[Owner] Generate random items."""
+    async def genitems(self, ctx: commands.Context, rarity: str, slot: str, num: int = 1):
+        """[Dev] Generate random items."""
+        if not await no_dev_prompt(ctx):
+            return
         user = ctx.author
         rarity = rarity.lower()
         slot = slot.lower()
         if rarity not in RARITIES:
             return await smart_embed(
-                ctx,
-                _("Invalid rarity; choose one of {list}.").format(list=humanize_list(RARITIES)),
+                ctx, _("Invalid rarity; choose one of {list}.").format(list=humanize_list(RARITIES)),
             )
         elif slot not in ORDER:
-            return await smart_embed(
-                ctx, _("Invalid slot; choose one of {list}.").format(list=humanize_list(ORDER))
-            )
+            return await smart_embed(ctx, _("Invalid slot; choose one of {list}.").format(list=humanize_list(ORDER)))
         async with self.get_lock(user):
             try:
-                c = await Character.from_json(self.config, user)
+                c = await Character.from_json(self.config, user, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 return
-            for i in range(num):
+            for _loop_counter in range(num):
                 await c.add_to_backpack(await self._genitem(rarity, slot))
             await self.config.user(ctx.author).set(await c.to_json(self.config))
         await ctx.invoke(self._backpack)
@@ -733,22 +814,291 @@ class Adventure(BaseCog):
     @commands.command()
     @commands.bot_has_permissions(add_reactions=True)
     @commands.is_owner()
-    async def copyuser(self, ctx: Context, user_id: int):
+    async def copyuser(self, ctx: commands.Context, user_id: int):
         """[Owner] Copy another members data to yourself.
 
         Note this overrides your current data.
         """
-        user = namedtuple("User", "id")
-        user = user(user_id)
-        user_data = await self.config.user(user).all()
+        user_data = await self.config.user_from_id(user_id).all()
         await self.config.user(ctx.author).set(user_data)
         await ctx.tick()
+
+    @commands.command(name="ebackpack")
+    @commands.bot_has_permissions(add_reactions=True)
+    async def commands_equipable_backpack(
+        self,
+        ctx: commands.Context,
+        show_diff: Optional[bool] = False,
+        rarity: Optional[RarityConverter] = None,
+        *,
+        slot: Optional[SlotConverter] = None,
+    ):
+        """This shows the contents of your backpack that can be equipped.
+
+        Give it a rarity and/or slot to filter what backpack items to show.
+
+        Note: An item **degrade** level is how many rebirths it will last, before it is broken down.
+        """
+        assert isinstance(rarity, str) or rarity is None
+        assert isinstance(slot, str) or slot is None
+        if not await self.allow_in_dm(ctx):
+            return await smart_embed(ctx, _("This command is not available in DM's on this bot."))
+        if not ctx.invoked_subcommand:
+            try:
+                c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
+            except Exception as exc:
+                log.exception("Error with the new character sheet", exc_info=exc)
+                return
+            if rarity:
+                rarity = rarity.lower()
+                if rarity not in RARITIES:
+                    return await smart_embed(
+                        ctx, _("{} is not a valid rarity, select one of {}").format(rarity, humanize_list(RARITIES)),
+                    )
+            if slot:
+                slot = slot.lower()
+                if slot not in ORDER:
+                    return await smart_embed(
+                        ctx, _("{} is not a valid slot, select one of {}").format(slot, humanize_list(ORDER)),
+                    )
+
+            backpack_pages = await c.get_backpack(rarity=rarity, slot=slot, show_delta=show_diff, equippable=True)
+            if backpack_pages:
+                return await menu(ctx, backpack_pages, DEFAULT_CONTROLS)
+            else:
+                return await smart_embed(ctx, _("You have no equippable items that match this query."),)
+
+    @commands.group(name="cbackpack")
+    @commands.bot_has_permissions(add_reactions=True)
+    async def commands_cbackpack(
+        self, ctx: commands.Context,
+    ):
+        """Complex backpack management tools.
+
+        **--slot** - Accepts multiple slots (use quotes if there are spaces in a slot name).
+        **--rarity** - Accepts multiple rarities (use quotes if there are spaces in a rarity name).
+        **--set** - Accepts multiple sets (use quotes if there are spaces in the set name).
+        **--equip** - If used will only show equippable items.
+        **--diff** - If used will show the stat delta compared to what you currently have equipped.
+        **--match** - Accepts a string, no quotes are needed. Will attempt to match items to this string.
+        ​ ​ ​  ​**--icase** - If `--match` and `--icase` are used, matches will not be case sensitive.
+        For the following arguments:
+        ​ ​ These arguments accept 1 or 2 numbers. If 1 is passed it is treated as an equal match, if 2 then it is a range.
+        ​ ​ ​ ​ **--str**
+        ​ ​ ​ ​ **--int**
+        ​ ​ ​ ​ **--cha**
+        ​ ​ ​ ​ **--luc**
+        ​ ​ ​ ​ **--dex**
+        ​ ​ ​ ​ **--lvl**
+        ​ ​ ​ ​ **--deg** (Only works on `[p]cbackpack show`)
+
+        Subcommands: These take the same arguments listed above.
+        """
+
+    @commands_cbackpack.command(name="show")
+    async def commands_cbackpack_show(
+        self, ctx: commands.Context, *, query: BackpackFilterParser,
+    ):
+        """This shows the contents of your backpack."""
+        if not await self.allow_in_dm(ctx):
+            return await smart_embed(ctx, _("This command is not available in DM's on this bot."))
+        try:
+            c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
+        except Exception as exc:
+            log.exception("Error with the new character sheet", exc_info=exc)
+            return
+        backpack_pages = await c.get_argparse_backpack(query)
+        if backpack_pages:
+            controls = DEFAULT_CONTROLS.copy()
+
+            async def _backpack_info(
+                ctx: commands.Context,
+                pages: list,
+                controls: MutableMapping,
+                message: discord.Message,
+                page: int,
+                timeout: float,
+                emoji: str,
+            ):
+                if message:
+                    await ctx.send_help(self.commands_cbackpack)
+                    with contextlib.suppress(discord.HTTPException):
+                        await message.delete()
+                    return None
+
+            controls["\N{INFORMATION SOURCE}\N{VARIATION SELECTOR-16}"] = _backpack_info
+            return await menu(ctx, backpack_pages, DEFAULT_CONTROLS)
+        else:
+            return await smart_embed(ctx, _("You have no items that match this query."),)
+
+    @commands_cbackpack.command(name="disassemble")
+    async def commands_cbackpack_disassemble(self, ctx: commands.Context, *, query: BackpackFilterParser):
+        """
+        Disassemble items from your backpack.
+
+        This will provide a chance for a chest,
+        or the item might break while you are handling it...
+        """
+        if self.in_adventure(ctx):
+            return await smart_embed(
+                ctx, _("You tried to disassemble an item but the monster ahead of you commands your attention."),
+            )
+        query.pop("degrade", None)  # Disallow selling by degrade levels
+        async with self.get_lock(ctx.author):
+            try:
+                character = await Character.from_json(self.config, ctx.author, self._daily_bonus)
+            except Exception as exc:
+                log.exception("Error with the new character sheet", exc_info=exc)
+                return
+            slots = await character.get_argparse_backpack_items(query, rarity_exclude=["forged"])
+            if (total_items := sum(len(i) for s, i in slots)) > 2:
+
+                msg = await ctx.send(
+                    "Are you sure you want to disassemble {count} unique items and their duplicates?".format(
+                        count=humanize_number(total_items)
+                    )
+                )
+                start_adding_reactions(msg, ReactionPredicate.YES_OR_NO_EMOJIS)
+                pred = ReactionPredicate.yes_or_no(msg, ctx.author)
+                try:
+                    await ctx.bot.wait_for("reaction_add", check=pred, timeout=60)
+                except asyncio.TimeoutError:
+                    await self._clear_react(msg)
+                    return
+
+                if not pred.result:
+                    await ctx.send("Not disassembling those items.")
+                    return
+        failed = 0
+        success = 0
+        disassembled = set()
+
+        async for slot_name, slot_group in AsyncIter(slots, steps=100):
+            async for item_name, item in AsyncIter(slot_group, steps=100):
+                try:
+                    item = character.backpack[item.name]
+                except KeyError:
+                    continue
+                if item.name in disassembled:
+                    continue
+                if item.rarity in ["forged"]:
+                    failed += 1
+                    continue
+                index = min(RARITIES.index(item.rarity), 4)
+                disassembled.add(item.name)
+                owned = item.owned
+                async for _loop_counter in AsyncIter(range(0, owned), steps=100):
+                    if character.heroclass["name"] != "Tinkerer":
+                        roll = random.randint(0, 5)
+                        chests = 1
+                    else:
+                        roll = random.randint(0, 3)
+                        chests = random.randint(1, 2)
+                    if roll != 0:
+                        item.owned -= 1
+                        if item.owned <= 0 and item.name in character.backpack:
+                            del character.backpack[item.name]
+                        failed += 1
+                    else:
+                        item.owned -= 1
+                        if item.owned <= 0 and item.name in character.backpack:
+                            del character.backpack[item.name]
+                        character.treasure[index] += chests
+                        success += 1
+        if (not failed) and (not success):
+            return await smart_embed(ctx, _("No items matched your query.").format(),)
+        else:
+
+            await self.config.user(ctx.author).set(await character.to_json(self.config))
+            return await smart_embed(
+                ctx,
+                _("You attempted to disassemble multiple items: {succ} were successful and {fail} failed.").format(
+                    succ=humanize_number(success), fail=humanize_number(failed)
+                ),
+            )
+
+    @commands_cbackpack.command(name="sell", cooldown_after_parsing=True)
+    @commands.cooldown(rate=3, per=60, type=commands.BucketType.user)
+    async def commands_cbackpack_sell(self, ctx: commands.Context, *, query: BackpackFilterParser):
+        """Sell items from your backpack.
+
+        Forged, Set and Event items cannot be sold using this command.
+        """
+
+        if self.in_adventure(ctx):
+            return await smart_embed(
+                ctx, _("You tried to go sell your items but the monster ahead is not allowing you to leave."),
+            )
+        query.pop("degrade", None)  # Disallow selling by degrade levels
+        async with self.get_lock(ctx.author):
+            try:
+                character = await Character.from_json(self.config, ctx.author, self._daily_bonus)
+            except Exception as exc:
+                log.exception("Error with the new character sheet", exc_info=exc)
+                return
+            slots = await character.get_argparse_backpack_items(query, rarity_exclude=["forged"])
+            if (total_items := sum(len(i) for s, i in slots)) > 2:
+                msg = await ctx.send(
+                    "Are you sure you want to sell {count} items in your inventory that match this query?".format(
+                        count=humanize_number(total_items)
+                    )
+                )
+                start_adding_reactions(msg, ReactionPredicate.YES_OR_NO_EMOJIS)
+                pred = ReactionPredicate.yes_or_no(msg, ctx.author)
+                try:
+                    await ctx.bot.wait_for("reaction_add", check=pred, timeout=60)
+                except asyncio.TimeoutError:
+                    await self._clear_react(msg)
+                    return
+
+                if not pred.result:
+                    await ctx.send("Not selling those items.")
+                    return
+            total_price = 0
+            msg = ""
+            async with ctx.typing():
+                async for slot_name, slot_group in AsyncIter(slots, steps=100):
+                    async for item_name, item in AsyncIter(slot_group, steps=100):
+                        old_owned = item.owned
+                        item_price = 0
+                        async for _loop_counter in AsyncIter(range(0, old_owned), steps=100):
+                            item.owned -= 1
+                            item_price += self._sell(character, item)
+                            if item.owned <= 0 and item.name in character.backpack:
+                                del character.backpack[item.name]
+                        item_price = max(item_price, 0)
+                        msg += _("{old_item} sold for {price}.\n").format(
+                            old_item=str(old_owned) + " " + str(item), price=humanize_number(item_price),
+                        )
+                        total_price += item_price
+                if total_price > 0:
+                    try:
+                        await bank.deposit_credits(ctx.author, total_price)
+                    except BalanceTooHigh as e:
+                        await bank.set_balance(ctx.author, e.max_balance)
+                character.last_known_currency = await bank.get_balance(ctx.author)
+                character.last_currency_check = time.time()
+                await self.config.user(ctx.author).set(await character.to_json(self.config))
+            if total_price == 0:
+                return await smart_embed(ctx, _("No items matched your query.").format(),)
+            if msg:
+                msg_list = []
+                new_msg = _("{author} sold {number} items and their duplicates for {price}.\n\n{items}").format(
+                    author=self.escape(ctx.author.display_name),
+                    number=humanize_number(total_items),
+                    price=humanize_number(total_price),
+                    items=msg,
+                )
+                for page in pagify(new_msg, shorten_by=10, page_length=1900):
+                    msg_list.append(box(page, lang="css"))
+                await menu(ctx, msg_list, DEFAULT_CONTROLS)
 
     @commands.group(name="backpack", autohelp=False)
     @commands.bot_has_permissions(add_reactions=True)
     async def _backpack(
         self,
-        ctx: Context,
+        ctx: commands.Context,
+        show_diff: Optional[bool] = False,
         rarity: Optional[RarityConverter] = None,
         *,
         slot: Optional[SlotConverter] = None,
@@ -762,6 +1112,8 @@ class Adventure(BaseCog):
         Equip:       `[p]backpack equip item_name`
         Sell All:    `[p]backpack sellall rarity slot`
         Disassemble: `[p]backpack disassemble item_name`
+
+        Note: An item **degrade** level is how many rebirths it will last, before it is broken down.
         """
         assert isinstance(rarity, str) or rarity is None
         assert isinstance(slot, str) or slot is None
@@ -769,7 +1121,7 @@ class Adventure(BaseCog):
             return await smart_embed(ctx, _("This command is not available in DM's on this bot."))
         if not ctx.invoked_subcommand:
             try:
-                c = await Character.from_json(self.config, ctx.author)
+                c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 return
@@ -777,44 +1129,49 @@ class Adventure(BaseCog):
                 rarity = rarity.lower()
                 if rarity not in RARITIES:
                     return await smart_embed(
-                        ctx,
-                        _("{} is not a valid rarity, select one of {}").format(
-                            rarity, humanize_list(RARITIES)
-                        ),
+                        ctx, _("{} is not a valid rarity, select one of {}").format(rarity, humanize_list(RARITIES)),
                     )
             if slot:
                 slot = slot.lower()
                 if slot not in ORDER:
                     return await smart_embed(
-                        ctx,
-                        _("{} is not a valid slot, select one of {}").format(
-                            slot, humanize_list(ORDER)
-                        ),
+                        ctx, _("{} is not a valid slot, select one of {}").format(slot, humanize_list(ORDER)),
                     )
 
-            backpack_contents = _("[{author}'s backpack] \n\n{backpack}\n").format(
-                author=self.escape(ctx.author.display_name),
-                backpack=c.get_backpack(rarity=rarity, slot=slot),
-            )
-            msgs = []
-            for page in pagify(backpack_contents, delims=["\n"], shorten_by=20, page_length=1900):
-                msgs.append(box(page, lang="css"))
-            return await menu(ctx, msgs, DEFAULT_CONTROLS)
+            msgs = await c.get_backpack(rarity=rarity, slot=slot, show_delta=show_diff)
+            if not msgs:
+                return await smart_embed(ctx, _("You have no items in your backpack."),)
+            controls = DEFAULT_CONTROLS.copy()
+
+            async def _backpack_info(
+                ctx: commands.Context,
+                pages: list,
+                controls: MutableMapping,
+                message: discord.Message,
+                page: int,
+                timeout: float,
+                emoji: str,
+            ):
+                if message:
+                    await ctx.send_help(self._backpack)
+                    with contextlib.suppress(discord.HTTPException):
+                        await message.delete()
+                    return None
+
+            controls["\N{INFORMATION SOURCE}\N{VARIATION SELECTOR-16}"] = _backpack_info
+            return await menu(ctx, msgs, controls)
 
     @_backpack.command(name="equip")
-    async def backpack_equip(self, ctx: Context, *, equip_item: ItemConverter):
+    async def backpack_equip(self, ctx: commands.Context, *, equip_item: EquipableItemConverter):
         """Equip an item from your backpack."""
         assert isinstance(equip_item, Item)
         if self.in_adventure(ctx):
             return await smart_embed(
-                ctx,
-                _(
-                    "You tried to equip an item but the monster ahead of you commands your attention."
-                ),
+                ctx, _("You tried to equip an item but the monster ahead of you commands your attention."),
             )
         async with self.get_lock(ctx.author):
             try:
-                c = await Character.from_json(self.config, ctx.author)
+                c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 return
@@ -824,12 +1181,10 @@ class Adventure(BaseCog):
 
             if not can_equip(c, equip_item):
                 return await smart_embed(
-                    ctx,
-                    _("You need to be level `{level}` to equip this item.").format(
-                        level=equiplevel
-                    ),
+                    ctx, _("You need to be level `{level}` to equip this item.").format(level=equiplevel),
                 )
-            equip = c.backpack[equip_item.name]
+
+            equip = c.backpack.get(equip_item.name)
             if equip:
                 slot = equip.slot[0]
                 if len(equip.slot) > 1:
@@ -843,10 +1198,7 @@ class Adventure(BaseCog):
                     )
                 else:
                     equip_msg = box(
-                        _(
-                            "{author} equipped {item} "
-                            "({slot} slot) and put {put} into their backpack."
-                        ).format(
+                        _("{author} equipped {item} ({slot} slot) and put {put} into their backpack.").format(
                             author=self.escape(ctx.author.display_name),
                             item=str(equip),
                             slot=slot,
@@ -858,141 +1210,243 @@ class Adventure(BaseCog):
                 c = await c.equip_item(equip, True, self.is_dev(ctx.author))  # FIXME:
                 await self.config.user(ctx.author).set(await c.to_json(self.config))
 
-    @_backpack.command(name="disassemble")
-    async def backpack_disassemble(self, ctx: Context, *, backpack_item: ItemConverter):
-        """Disassemble a set item from your backpack."""
-        assert isinstance(backpack_item, Item)
+    @_backpack.command(name="eset", cooldown_after_parsing=True)
+    @commands.cooldown(rate=1, per=600, type=commands.BucketType.user)
+    async def backpack_eset(self, ctx: commands.Context, *, set_name: str):
+        """Equip all parts of a set that you own."""
         if self.in_adventure(ctx):
+            ctx.command.reset_cooldown(ctx)
             return await smart_embed(
-                ctx,
-                _(
-                    "You tried to disassemble an item but the "
-                    "monster ahead of you commands your attention."
-                ),
+                ctx, _("You tried to magically equip multiple items at once, but the monster ahead nearly killed you."),
+            )
+        set_list = humanize_list(sorted([f"`{i}`" for i in self.SET_BONUSES.keys()], key=str.lower))
+        if set_name is None:
+            ctx.command.reset_cooldown(ctx)
+            return await smart_embed(
+                ctx, _("Use this command with one of the following set names: \n{sets}").format(sets=set_list),
             )
         async with self.get_lock(ctx.author):
             try:
-                character = await Character.from_json(self.config, ctx.author)
+                character = await Character.from_json(self.config, ctx.author, self._daily_bonus)
+            except Exception as exc:
+                log.exception("Error with the new character sheet", exc_info=exc)
+                ctx.command.reset_cooldown(ctx)
+                return
+
+            pieces = await character.get_set_count(return_items=True, set_name=set_name.title())
+            if not pieces:
+                ctx.command.reset_cooldown(ctx)
+                return await smart_embed(
+                    ctx, _("You have no pieces of `{set_name}` that you can equip.").format(set_name=set_name),
+                )
+            for piece in pieces:
+                character = await character.equip_item(piece, from_backpack=True)
+            await self.config.user(ctx.author).set(await character.to_json(self.config))
+            await smart_embed(
+                ctx,
+                _("I've equipped all pieces of `{set_name}` that you are able to equip.").format(set_name=set_name),
+            )
+
+    @_backpack.command(name="disassemble")
+    async def backpack_disassemble(self, ctx: commands.Context, *, backpack_items: ItemsConverter):
+        """
+        Disassemble items from your backpack.
+
+        This will provide a chance for a chest,
+        or the item might break while you are handling it...
+        """
+        if self.in_adventure(ctx):
+            return await smart_embed(
+                ctx, _("You tried to disassemble an item but the monster ahead of you commands your attention."),
+            )
+
+        async with self.get_lock(ctx.author):
+            if len(backpack_items[1]) > 2:
+                msg = await ctx.send(
+                    "Are you sure you want to disassemble {count} unique items and their duplicates?".format(
+                        count=humanize_number(len(backpack_items[1]))
+                    )
+                )
+                start_adding_reactions(msg, ReactionPredicate.YES_OR_NO_EMOJIS)
+                pred = ReactionPredicate.yes_or_no(msg, ctx.author)
+                try:
+                    await ctx.bot.wait_for("reaction_add", check=pred, timeout=60)
+                except asyncio.TimeoutError:
+                    await self._clear_react(msg)
+                    return
+
+                if not pred.result:
+                    await ctx.send("Not disassembling those items.")
+                    return
+
+            try:
+                character = await Character.from_json(self.config, ctx.author, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 return
-
-            try:
-                item = character.backpack[backpack_item.name]
-            except KeyError:
-                return
-
-            if item.rarity != "set":
-                return await smart_embed(ctx, _("You can only disassemble set items."))
-            if character.heroclass["name"] != "Tinkerer":
-                roll = random.randint(0, 1)
-            else:
-                roll = random.randint(0, 3)
-
-            if roll == 0:
-                item.owned -= 1
-                if item.owned <= 0:
-                    del character.backpack[item.name]
-                await self.config.user(ctx.author).set(await character.to_json(self.config))
-                return await smart_embed(
-                    ctx,
-                    _("Your attempt at disassembling {} failed and it has been destroyed.").format(
-                        item.name
-                    ),
-                )
-            else:
-                item.owned -= 1
-                if item.owned <= 0:
-                    del character.backpack[item.name]
-                character.treasure[3] += roll
-                await self.config.user(ctx.author).set(await character.to_json(self.config))
-                return await smart_embed(
-                    ctx,
-                    _(
-                        "Your attempt at disassembling {} was successful "
-                        "and you have received {} legendary {}."
-                    ).format(item.name, roll, _("chests") if roll > 1 else _("chest")),
-                )
+            failed = 0
+            success = 0
+            op = backpack_items[0]
+            disassembled = set()
+            async for item in AsyncIter(backpack_items[1], steps=100):
+                try:
+                    item = character.backpack[item.name]
+                except KeyError:
+                    continue
+                if item.name in disassembled:
+                    continue
+                if item.rarity in ["forged"]:
+                    continue
+                index = min(RARITIES.index(item.rarity), 4)
+                if op == "single":
+                    if character.heroclass["name"] != "Tinkerer":
+                        roll = random.randint(0, 5)
+                        chests = 1
+                    else:
+                        roll = random.randint(0, 3)
+                        chests = random.randint(1, 2)
+                    if roll != 0:
+                        item.owned -= 1
+                        if item.owned <= 0:
+                            del character.backpack[item.name]
+                        await self.config.user(ctx.author).set(await character.to_json(self.config))
+                        return await smart_embed(
+                            ctx,
+                            _("Your attempt at disassembling `{}` failed and it has been destroyed.").format(item.name),
+                        )
+                    else:
+                        item.owned -= 1
+                        if item.owned <= 0:
+                            del character.backpack[item.name]
+                        character.treasure[index] += chests
+                        await self.config.user(ctx.author).set(await character.to_json(self.config))
+                        return await smart_embed(
+                            ctx,
+                            _("Your attempt at disassembling `{}` was successful and you have received {} {}.").format(
+                                item.name, chests, _("chests") if chests > 1 else _("chest")
+                            ),
+                        )
+                elif op == "all":
+                    disassembled.add(item.name)
+                    owned = item.owned
+                    async for _loop_counter in AsyncIter(range(0, owned), steps=100):
+                        if character.heroclass["name"] != "Tinkerer":
+                            roll = random.randint(0, 5)
+                            chests = 1
+                        else:
+                            roll = random.randint(0, 3)
+                            chests = random.randint(1, 2)
+                        if roll != 0:
+                            item.owned -= 1
+                            if item.owned <= 0 and item.name in character.backpack:
+                                del character.backpack[item.name]
+                            failed += 1
+                        else:
+                            item.owned -= 1
+                            if item.owned <= 0 and item.name in character.backpack:
+                                del character.backpack[item.name]
+                            character.treasure[index] += chests
+                            success += 1
+            await self.config.user(ctx.author).set(await character.to_json(self.config))
+            return await smart_embed(
+                ctx,
+                _("You attempted to disassemble multiple items: {succ} were successful and {fail} failed.").format(
+                    succ=humanize_number(success), fail=humanize_number(failed)
+                ),
+            )
 
     @_backpack.command(name="sellall")
     async def backpack_sellall(
-        self,
-        ctx: Context,
-        rarity: Optional[RarityConverter] = None,
-        *,
-        slot: Optional[SlotConverter] = None,
+        self, ctx: commands.Context, rarity: Optional[RarityConverter] = None, *, slot: Optional[SlotConverter] = None,
     ):
         """Sell all items in your backpack. Optionally specify rarity or slot."""
         assert isinstance(rarity, str) or rarity is None
         assert isinstance(slot, str) or slot is None
         if self.in_adventure(ctx):
             return await smart_embed(
-                ctx,
-                _(
-                    "You tried to go sell your items but the monster ahead is not allowing you to leave."
-                ),
+                ctx, _("You tried to go sell your items but the monster ahead is not allowing you to leave."),
             )
         if rarity:
             rarity = rarity.lower()
             if rarity not in RARITIES:
                 return await smart_embed(
-                    ctx,
-                    _("{} is not a valid rarity, select one of {}").format(
-                        rarity, humanize_list(RARITIES)
-                    ),
+                    ctx, _("{} is not a valid rarity, select one of {}").format(rarity, humanize_list(RARITIES)),
                 )
-            if rarity.lower() in ["set", "forged"]:
-                return await smart_embed(
-                    ctx, _("You cannot sell `{rarity}` rarity items.").format(rarity=rarity)
-                )
+            if rarity.lower() in ["forged"]:
+                return await smart_embed(ctx, _("You cannot sell `{rarity}` rarity items.").format(rarity=rarity))
         if slot:
             slot = slot.lower()
             if slot not in ORDER:
                 return await smart_embed(
-                    ctx,
-                    _("{} is not a valid slot, select one of {}").format(
-                        slot, humanize_list(ORDER)
-                    ),
+                    ctx, _("{} is not a valid slot, select one of {}").format(slot, humanize_list(ORDER)),
                 )
 
         async with self.get_lock(ctx.author):
+            if rarity and slot:
+                msg = await ctx.send(
+                    "Are you sure you want to sell all {rarity} {slot} items in your inventory?".format(
+                        rarity=rarity, slot=slot
+                    )
+                )
+            elif rarity or slot:
+                msg = await ctx.send(
+                    "Are you sure you want to sell all{rarity}{slot} items in your inventory?".format(
+                        rarity=f" {rarity}" if rarity else "", slot=f" {slot}" if slot else ""
+                    )
+                )
+            else:
+                msg = await ctx.send("Are you sure you want to sell all items in your inventory?")
+
+            start_adding_reactions(msg, ReactionPredicate.YES_OR_NO_EMOJIS)
+            pred = ReactionPredicate.yes_or_no(msg, ctx.author)
+            try:
+                await ctx.bot.wait_for("reaction_add", check=pred, timeout=60)
+            except asyncio.TimeoutError:
+                await self._clear_react(msg)
+                return
+
+            if not pred.result:
+                await ctx.send("Not selling those items.")
+                return
+
             msg = ""
             try:
-                c = await Character.from_json(self.config, ctx.author)
+                c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 return
             total_price = 0
-            items = [i for n, i in c.backpack.items() if i.rarity not in ["forged", "set"]]
-            count = 0
-            for item in items:
-                if rarity and item.rarity != rarity:
-                    continue
-                if slot:
-                    if len(item.slot) == 1 and slot != item.slot[0]:
+            async with ctx.typing():
+                items = [i for n, i in c.backpack.items() if i.rarity not in ["forged"]]
+                count = 0
+                async for item in AsyncIter(items, steps=100):
+                    if rarity and item.rarity != rarity:
                         continue
-                    elif len(item.slot) == 2 and slot != "two handed":
-                        continue
-                item_price = 0
-                old_owned = item.owned
-                for x in range(0, item.owned):
-                    item.owned -= 1
-                    item_price += self._sell(c, item)
-                    if item.owned <= 0:
-                        del c.backpack[item.name]
-                    if not count % 10:
-                        await asyncio.sleep(0.1)
-                    count += 1
-                msg += _("{old_item} sold for {price}.\n").format(
-                    old_item=str(old_owned) + " " + str(item), price=humanize_number(item_price)
-                )
-                total_price += item_price
-                await asyncio.sleep(0.1)
-                item_price = max(item_price, 0)
-                if item_price > 0:
-                    with contextlib.suppress(BalanceTooHigh):
-                        await bank.deposit_credits(ctx.author, item_price)
-            await self.config.user(ctx.author).set(await c.to_json(self.config))
+                    if slot:
+                        if len(item.slot) == 1 and slot != item.slot[0]:
+                            continue
+                        elif len(item.slot) == 2 and slot != "two handed":
+                            continue
+                    item_price = 0
+                    old_owned = item.owned
+                    async for _loop_counter in AsyncIter(range(0, old_owned), steps=100):
+                        item.owned -= 1
+                        item_price += self._sell(c, item)
+                        if item.owned <= 0:
+                            del c.backpack[item.name]
+                    item_price = max(item_price, 0)
+                    msg += _("{old_item} sold for {price}.\n").format(
+                        old_item=str(old_owned) + " " + str(item), price=humanize_number(item_price),
+                    )
+                    total_price += item_price
+                if total_price > 0:
+                    try:
+                        await bank.deposit_credits(ctx.author, total_price)
+                    except BalanceTooHigh as e:
+                        await bank.set_balance(ctx.author, e.max_balance)
+                c.last_known_currency = await bank.get_balance(ctx.author)
+                c.last_currency_check = time.time()
+                await self.config.user(ctx.author).set(await c.to_json(self.config))
         msg_list = []
         new_msg = _("{author} sold all their{rarity} items for {price}.\n\n{items}").format(
             author=self.escape(ctx.author.display_name),
@@ -1006,24 +1460,20 @@ class Adventure(BaseCog):
 
     @_backpack.command(name="sell", cooldown_after_parsing=True)
     @commands.cooldown(rate=3, per=60, type=commands.BucketType.user)
-    async def backpack_sell(self, ctx: Context, *, item: ItemConverter):
+    async def backpack_sell(self, ctx: commands.Context, *, item: ItemConverter):
         """Sell an item from your backpack."""
 
         if self.in_adventure(ctx):
             return await smart_embed(
-                ctx,
-                _(
-                    "You tried to go sell your items but the monster ahead is not allowing you to leave."
-                ),
+                ctx, _("You tried to go sell your items but the monster ahead is not allowing you to leave."),
             )
-        if item.rarity == "forged":
+        if item.rarity in ["forged"]:
             ctx.command.reset_cooldown(ctx)
             return await ctx.send(
                 box(
-                    _(
-                        "\n{author}, your {device} is "
-                        "refusing to be sold and bit your finger for trying."
-                    ).format(author=self.escape(ctx.author.display_name), device=str(item)),
+                    _("\n{author}, your {device} is refusing to be sold and bit your finger for trying.").format(
+                        author=self.escape(ctx.author.display_name), device=str(item)
+                    ),
                     lang="css",
                 )
             )
@@ -1031,7 +1481,7 @@ class Adventure(BaseCog):
         lock = self.get_lock(ctx.author)
         await lock.acquire()
         try:
-            c = await Character.from_json(self.config, ctx.author)
+            c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
         except Exception as exc:
             ctx.command.reset_cooldown(ctx)
             log.exception("Error with the new character sheet", exc_info=exc)
@@ -1075,12 +1525,10 @@ class Adventure(BaseCog):
         await menu(ctx, messages, back_pack_sell_controls, timeout=60)
 
     async def _backpack_sell_button_action(self, ctx, emoji, page, item, price_shown, character):
-        currency_name = await bank.get_currency_name(ctx.guild)
+        currency_name = await bank.get_currency_name(ctx.guild,)
         msg = ""
         try:
-            if (
-                emoji == "\N{DIGIT ONE}\N{COMBINING ENCLOSING KEYCAP}"
-            ):  # user reacted with one to sell.
+            if emoji == "\N{DIGIT ONE}\N{COMBINING ENCLOSING KEYCAP}":  # user reacted with one to sell.
                 ctx.command.reset_cooldown(ctx)
                 # sell one of the item
                 price = 0
@@ -1096,16 +1544,16 @@ class Adventure(BaseCog):
                     del character.backpack[item.name]
                 price = max(price, 0)
                 if price > 0:
-                    with contextlib.suppress(BalanceTooHigh):
+                    try:
                         await bank.deposit_credits(ctx.author, price)
-            elif (
-                emoji == "\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS}"
-            ):  # user wants to sell all owned.
+                    except BalanceTooHigh as e:
+                        await bank.set_balance(ctx.author, e.max_balance)
+            elif emoji == "\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS}":  # user wants to sell all owned.
                 ctx.command.reset_cooldown(ctx)
                 price = 0
                 old_owned = item.owned
                 count = 0
-                for x in range(0, item.owned):
+                for _loop_counter in range(0, item.owned):
                     item.owned -= 1
                     price += price_shown
                     if item.owned <= 0:
@@ -1113,9 +1561,7 @@ class Adventure(BaseCog):
                     if not count % 10:
                         await asyncio.sleep(0.1)
                     count += 1
-                msg += _(
-                    "**{author}** sold all their {old_item} for {price} {currency_name}.\n"
-                ).format(
+                msg += _("**{author}** sold all their {old_item} for {price} {currency_name}.\n").format(
                     author=self.escape(ctx.author.display_name),
                     old_item=box(str(item) + " - " + str(old_owned), lang="css"),
                     price=humanize_number(price),
@@ -1123,11 +1569,12 @@ class Adventure(BaseCog):
                 )
                 price = max(price, 0)
                 if price > 0:
-                    with contextlib.suppress(BalanceTooHigh):
+                    try:
                         await bank.deposit_credits(ctx.author, price)
+                    except BalanceTooHigh as e:
+                        await bank.set_balance(ctx.author, e.max_balance)
             elif (
-                emoji
-                == "\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS WITH CIRCLED ONE OVERLAY}"
+                emoji == "\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS WITH CIRCLED ONE OVERLAY}"
             ):  # user wants to sell all but one.
                 if item.owned == 1:
                     ctx.command.reset_cooldown(ctx)
@@ -1135,16 +1582,14 @@ class Adventure(BaseCog):
                 price = 0
                 old_owned = item.owned
                 count = 0
-                for x in range(1, item.owned):
+                for _loop_counter in range(1, item.owned):
                     item.owned -= 1
                     price += price_shown
                 if not count % 10:
                     await asyncio.sleep(0.1)
                 count += 1
                 if price != 0:
-                    msg += _(
-                        "**{author}** sold all but one of their {old_item} for {price} {currency_name}.\n"
-                    ).format(
+                    msg += _("**{author}** sold all but one of their {old_item} for {price} {currency_name}.\n").format(
                         author=self.escape(ctx.author.display_name),
                         old_item=box(str(item) + " - " + str(old_owned - 1), lang="css"),
                         price=humanize_number(price),
@@ -1152,8 +1597,10 @@ class Adventure(BaseCog):
                     )
                     price = max(price, 0)
                     if price > 0:
-                        with contextlib.suppress(BalanceTooHigh):
+                        try:
                             await bank.deposit_credits(ctx.author, price)
+                        except BalanceTooHigh as e:
+                            await bank.set_balance(ctx.author, e.max_balance)
             else:  # user doesn't want to sell those items.
                 msg = _("Not selling those items.")
         finally:
@@ -1162,6 +1609,8 @@ class Adventure(BaseCog):
                 lock.release()
 
         if msg:
+            character.last_known_currency = await bank.get_balance(ctx.author)
+            character.last_currency_check = time.time()
             await self.config.user(ctx.author).set(await character.to_json(self.config))
             pages = [page for page in pagify(msg, delims=["\n"], page_length=1900)]
             if len(pages) > 1:
@@ -1171,46 +1620,57 @@ class Adventure(BaseCog):
 
     @_backpack.command(name="trade")
     async def backpack_trade(
-        self, ctx: Context, buyer: discord.Member, asking: Optional[int] = 1000, *, item
+        self, ctx: commands.Context, buyer: discord.Member, asking: Optional[int] = 1000, *, item: ItemConverter,
     ):
         """Trade an item from your backpack to another user."""
-        if self.in_adventure(ctx):
+        if ctx.author == buyer:
             return await smart_embed(
                 ctx,
-                _(
-                    "You tried to trade an item to a party member but the monster ahead commands your attention."
-                ),
+                _("You take the item and pass it from one hand to the other. Congratulations, you traded yourself."),
+            )
+        if self.in_adventure(ctx):
+            return await smart_embed(
+                ctx, _("You tried to trade an item to a party member but the monster ahead commands your attention."),
             )
         if self.in_adventure(user=buyer):
             return await smart_embed(
                 ctx,
-                _(
-                    "**{buyer}** is currently in an adventure... you were unable to reach them via pigeon."
-                ).format(buyer=self.escape(ctx.author.display_name)),
+                _("**{buyer}** is currently in an adventure... you were unable to reach them via pigeon.").format(
+                    buyer=self.escape(buyer.display_name)
+                ),
             )
         try:
-            c = await Character.from_json(self.config, ctx.author)
+            c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
         except Exception as exc:
             log.exception("Error with the new character sheet", exc_info=exc)
             return
-        if not any([x for x in c.backpack if item.lower() in x.lower()]):
+        try:
+            buy_user = await Character.from_json(self.config, buyer, self._daily_bonus)
+        except Exception as exc:
+            log.exception("Error with the new character sheet", exc_info=exc)
+            return
+
+        if buy_user.is_backpack_full(is_dev=self.is_dev(buyer)):
+            await ctx.send(
+                _("**{author}**'s backpack is currently full.").format(author=self.escape(buyer.display_name))
+            )
+            return
+
+        if not any([x for x in c.backpack if item.name.lower() == x.lower()]):
             return await smart_embed(
                 ctx,
                 _("**{author}**, you have to specify an item from your backpack to trade.").format(
                     author=self.escape(ctx.author.display_name)
                 ),
             )
-        lookup = list(x for n, x in c.backpack.items() if item.lower() in x.name.lower())
+        lookup = list(x for n, x in c.backpack.items() if str(item) == str(x))
         if len(lookup) > 1:
             await smart_embed(
                 ctx,
                 _(
                     "**{author}**, I found multiple items ({items}) "
                     "matching that name in your backpack.\nPlease be more specific."
-                ).format(
-                    author=self.escape(ctx.author.display_name),
-                    items=humanize_list([x.name for x in lookup]),
-                ),
+                ).format(author=self.escape(ctx.author.display_name), items=humanize_list([x.name for x in lookup]),),
             )
             return
         if any([x for x in lookup if x.rarity == "forged"]):
@@ -1226,16 +1686,16 @@ class Adventure(BaseCog):
         elif any([x for x in lookup if x.rarity == "set"]):
             return await ctx.send(
                 box(
-                    _(
-                        "\n{character}, you cannot trade Set items as they are bound to your soul."
-                    ).format(character=self.escape(ctx.author.display_name)),
+                    _("\n{character}, you cannot trade Set items as they are bound to your soul.").format(
+                        character=self.escape(ctx.author.display_name)
+                    ),
                     lang="css",
                 )
             )
         else:
             item = lookup[0]
             hand = item.slot[0] if len(item.slot) < 2 else "two handed"
-            currency_name = await bank.get_currency_name(ctx.guild)
+            currency_name = await bank.get_currency_name(ctx.guild,)
             if str(currency_name).startswith("<"):
                 currency_name = "credits"
             trade_talk = box(
@@ -1275,49 +1735,38 @@ class Adventure(BaseCog):
                 if pred.result:  # buyer reacted with Yes.
                     with contextlib.suppress(discord.errors.NotFound):
                         if await bank.can_spend(buyer, asking):
-                            try:
-                                buy_user = await Character.from_json(self.config, buyer)
-                            except Exception as exc:
-                                log.exception("Error with the new character sheet", exc_info=exc)
-                                return
-                            if buy_user.rebirths < c.rebirths:
+                            if buy_user.rebirths + 1 < c.rebirths:
                                 return await smart_embed(
                                     ctx,
                                     _(
-                                        "You can only trade with people the same rebirth level or higher than yours."
+                                        "You can only trade with people that are the same "
+                                        "rebirth level, one rebirth level less than you, "
+                                        "or a higher rebirth level than yours."
                                     ),
                                 )
-                            await bank.transfer_credits(buyer, ctx.author, asking)
+                            try:
+                                await bank.transfer_credits(buyer, ctx.author, asking)
+                            except BalanceTooHigh as e:
+                                await bank.withdraw_credits(buyer, asking)
+                                await bank.set_balance(ctx.author, e.max_balance)
                             c.backpack[item.name].owned -= 1
+                            newly_owned = c.backpack[item.name].owned
                             if c.backpack[item.name].owned <= 0:
                                 del c.backpack[item.name]
                             async with self.get_lock(buyer):
-                                try:
-                                    buy_user = await Character.from_json(self.config, buyer)
-                                except Exception as exc:
-                                    log.exception(
-                                        "Error with the new character sheet", exc_info=exc
-                                    )
-                                    return
                                 if item.name in buy_user.backpack:
                                     buy_user.backpack[item.name].owned += 1
                                 else:
                                     item.owned = 1
                                     buy_user.backpack[item.name] = item
-                                await self.config.user(ctx.author).set(
-                                    await c.to_json(self.config)
-                                )
-                                await self.config.user(buyer).set(
-                                    await buy_user.to_json(self.config)
-                                )
+                                await self.config.user(buyer).set(await buy_user.to_json(self.config))
+                                item.owned = newly_owned
+                                await self.config.user(ctx.author).set(await c.to_json(self.config))
 
                             await trade_msg.edit(
                                 content=(
                                     box(
-                                        _(
-                                            "\n{author} traded {item} to "
-                                            "{buyer} for {asking} {currency_name}."
-                                        ).format(
+                                        _("\n{author} traded {item} to {buyer} for {asking} {currency_name}.").format(
                                             author=self.escape(ctx.author.display_name),
                                             item=item,
                                             buyer=self.escape(buyer.display_name),
@@ -1331,11 +1780,8 @@ class Adventure(BaseCog):
                             await self._clear_react(trade_msg)
                         else:
                             await trade_msg.edit(
-                                content=_(
-                                    "**{buyer}**, you do not have enough {currency_name}."
-                                ).format(
-                                    buyer=self.escape(buyer.display_name),
-                                    currency_name=currency_name,
+                                content=_("**{buyer}**, you do not have enough {currency_name}.").format(
+                                    buyer=self.escape(buyer.display_name), currency_name=currency_name,
                                 )
                             )
                 else:
@@ -1345,37 +1791,44 @@ class Adventure(BaseCog):
     @commands.command()
     @commands.bot_has_permissions(add_reactions=True)
     @commands.guild_only()
-    async def rebirth(self, ctx: Context):
+    async def rebirth(self, ctx: commands.Context):
         """Resets your character level and increases your rebirths by 1."""
         if self.in_adventure(ctx):
-            return await smart_embed(
-                ctx, _("You tried to rebirth but the monster ahead is commanding your attention.")
-            )
+            return await smart_embed(ctx, _("You tried to rebirth but the monster ahead is commanding your attention."))
         if not await self.allow_in_dm(ctx):
             return await smart_embed(ctx, _("This command is not available in DM's on this bot."))
         async with self.get_lock(ctx.author):
             try:
-                c = await Character.from_json(self.config, ctx.author)
+                c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 return
             if c.lvl < c.maxlevel:
-                return await smart_embed(
-                    ctx, _("You need to be level `{c.maxlevel}` to rebirth.").format(c=c)
-                )
+                return await smart_embed(ctx, _("You need to be level `{c.maxlevel}` to rebirth.").format(c=c))
+            if not c.last_currency_check + 10 < time.time():
+                return await smart_embed(ctx, _("You need to wait a little before rebirthing.").format(c=c))
             if not await bank.is_global():
                 rebirth_cost = await self.config.guild(ctx.guild).rebirth_cost()
             else:
                 rebirth_cost = await self.config.rebirth_cost()
-            rebirthcost = 1000 * c.rebirths * (rebirth_cost / 100.0)
-            has_fund = await has_funds(ctx.author, rebirthcost)
-            if not has_fund:
-                currency_name = await bank.get_currency_name(ctx.guild)
+            rebirthcost = 1000 * c.rebirths
+            current_balance = c.bal
+            last_known_currency = c.last_known_currency
+            if last_known_currency and current_balance / last_known_currency < 0.25:
+                currency_name = await bank.get_currency_name(ctx.guild,)
                 return await smart_embed(
                     ctx,
-                    _("You need more {currency_name} to be able to rebirth.").format(
-                        currency_name=currency_name
-                    ),
+                    _(
+                        "You tried to get rid of all your {currency_name} -- tsk tsk, "
+                        "once you get back up to {cur} {currency_name} try again."
+                    ).format(currency_name=currency_name, cur=humanize_number(last_known_currency),),
+                )
+            else:
+                has_fund = await has_funds(ctx.author, rebirthcost)
+            if not has_fund:
+                currency_name = await bank.get_currency_name(ctx.guild,)
+                return await smart_embed(
+                    ctx, _("You need more {currency_name} to be able to rebirth.").format(currency_name=currency_name),
                 )
             space = "\N{EN SPACE}"
             open_msg = await smart_embed(
@@ -1384,7 +1837,8 @@ class Adventure(BaseCog):
                     f"Rebirthing will:\n\n"
                     f"* cost {int(rebirth_cost)}% of your credits\n"
                     f"* cost all of your current gear\n"
-                    f"{space*4}- Legendary items last 3 rebirths\n"
+                    f"{space*4}- Legendary items loose one degradation point per rebirth "
+                    f"and are broken down when they have 0 left.\n"
                     f"{space*4}- Set items never disappear\n"
                     f"* set you back to level 1 while keeping your current class\n\n"
                     f"In turn, rebirthing will give you a higher stat base, a better chance "
@@ -1404,23 +1858,18 @@ class Adventure(BaseCog):
                 if not pred.result:
                     await open_msg.edit(
                         content=box(
-                            _("{c} decided not to rebirth.").format(
-                                c=self.escape(ctx.author.display_name)
-                            ),
-                            lang="css",
+                            _("{c} decided not to rebirth.").format(c=self.escape(ctx.author.display_name)), lang="css",
                         )
                     )
                     return await self._clear_react(open_msg)
 
                 try:
-                    c = await Character.from_json(self.config, ctx.author)
+                    c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
                 except Exception as exc:
                     log.exception("Error with the new character sheet", exc_info=exc)
                     return
                 if c.lvl < c.maxlevel:
-                    return await smart_embed(
-                        ctx, _("You need to be level `{c.maxlevel}` to rebirth.").format(c=c)
-                    )
+                    return await smart_embed(ctx, _("You need to be level `{c.maxlevel}` to rebirth.").format(c=c))
                 bal = await bank.get_balance(ctx.author)
                 if bal >= 1000:
                     withdraw = int((bal - 1000) * (rebirth_cost / 100.0))
@@ -1433,8 +1882,7 @@ class Adventure(BaseCog):
                     content=(
                         box(
                             _("{c}, congratulations on your rebirth.\nYou paid {bal}.").format(
-                                c=self.escape(ctx.author.display_name),
-                                bal=humanize_number(withdraw),
+                                c=self.escape(ctx.author.display_name), bal=humanize_number(withdraw),
                             ),
                             lang="css",
                         )
@@ -1447,111 +1895,123 @@ class Adventure(BaseCog):
     @commands.is_owner()
     async def devrebirth(
         self,
-        ctx: Context,
+        ctx: commands.Context,
         rebirth_level: int = 1,
         character_level: int = 1,
-        user: discord.Member = None,
+        users: commands.Greedy[discord.User] = None,
     ):
-        """[Owner] Set a users rebirth level."""
-        target = user or ctx.author
-        async with self.get_lock(target):
-            try:
-                c = await Character.from_json(self.config, target)
-            except Exception as exc:
-                log.exception("Error with the new character sheet", exc_info=exc)
+        """[Dev] Set multiple users rebirths and level."""
+        if not await no_dev_prompt(ctx):
+            return
+        targets = users or [ctx.author]
+        if not self.is_dev(ctx.author):
+            if rebirth_level > 100:
+                await ctx.send("Rebirth is too high.")
+                await ctx.send_help()
                 return
-
-            bal = await bank.get_balance(target)
-            if bal >= 1000:
-                withdraw = bal - 1000
-                await bank.withdraw_credits(target, withdraw)
-            else:
-                withdraw = bal
-                await bank.set_balance(target, 0)
-
-            await ctx.send(
-                content=(
-                    box(
-                        _("{c}, congratulations on your rebirth.\nYou paid {bal}.").format(
-                            c=self.escape(target.display_name), bal=humanize_number(withdraw)
-                        ),
-                        lang="css",
+            elif character_level > 1000:
+                await ctx.send("Level is too high.")
+                await ctx.send_help()
+                return
+        for target in targets:
+            async with self.get_lock(target):
+                try:
+                    c = await Character.from_json(self.config, target, self._daily_bonus)
+                except Exception as exc:
+                    log.exception("Error with the new character sheet", exc_info=exc)
+                    continue
+                bal = await bank.get_balance(target)
+                if bal >= 1000:
+                    withdraw = bal - 1000
+                    await bank.withdraw_credits(target, withdraw)
+                else:
+                    withdraw = bal
+                    await bank.set_balance(target, 0)
+                character_data = await c.rebirth(dev_val=rebirth_level)
+                await self.config.user(target).set(character_data)
+                await ctx.send(
+                    content=(
+                        box(
+                            _("{c}, congratulations on your rebirth.\nYou paid {bal}.").format(
+                                c=self.escape(target.display_name), bal=humanize_number(withdraw)
+                            ),
+                            lang="css",
+                        )
                     )
                 )
-            )
-            character_data = await c.rebirth(dev_val=rebirth_level)
-            character_data["lvl"] = character_level
-            await self.config.user(target).set(character_data)
+            await self._add_rewards(ctx, target, int((character_level) ** 3.5) + 1, 0, False)
         await ctx.tick()
 
     @commands.command()
     @commands.bot_has_permissions(add_reactions=True)
     @commands.is_owner()
-    async def devreset(self, ctx: commands.Context, user: discord.Member = None):
-        """[Owner] Reset the skill cooldown for this user."""
-        target = user or ctx.author
-        async with self.get_lock(target):
-            try:
-                c = await Character.from_json(self.config, target)
-            except Exception as exc:
-                log.exception("Error with the new character sheet", exc_info=exc)
-                return
-            c.heroclass["ability"] = False
-            c.heroclass["cooldown"] = 0
-            if "catch_cooldown" in c.heroclass:
-                c.heroclass["catch_cooldown"] = 0
-            await self.config.user(target).set(await c.to_json(self.config))
+    async def devreset(self, ctx: commands.Context, users: commands.Greedy[discord.User]):
+        """[Dev] Reset the skill cooldown for multiple users."""
+        if not await no_dev_prompt(ctx):
+            return
+        targets = users or [ctx.author]
+        for target in targets:
+            async with self.get_lock(target):
+                try:
+                    c = await Character.from_json(self.config, target, self._daily_bonus)
+                except Exception as exc:
+                    log.exception("Error with the new character sheet", exc_info=exc)
+                    return
+                c.heroclass["ability"] = False
+                c.heroclass["cooldown"] = 0
+                if "catch_cooldown" in c.heroclass:
+                    c.heroclass["catch_cooldown"] = 0
+                await self.config.user(target).set(await c.to_json(self.config))
         await ctx.tick()
 
     @commands.group(aliases=["loadouts"])
-    async def loadout(self, ctx: Context):
+    async def loadout(self, ctx: commands.Context):
         """Set up gear sets or loadouts."""
 
-    @loadout.command(name="save")
-    async def save_loadout(self, ctx: Context, name: str):
+    @loadout.command(name="save", aliases=["update"])
+    async def save_loadout(self, ctx: commands.Context, name: str):
         """Save your current equipment as a loadout."""
         if not await self.allow_in_dm(ctx):
             return await smart_embed(ctx, _("This command is not available in DM's on this bot."))
         name = name.lower()
         async with self.get_lock(ctx.author):
             try:
-                c = await Character.from_json(self.config, ctx.author)
+                c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 return
             if name in c.loadouts:
-                await smart_embed(
-                    ctx,
-                    _("{author}, you already have a loadout named {name}.").format(
-                        author=self.escape(ctx.author.display_name), name=name
-                    ),
-                )
-                return
-            else:
+                msg = await ctx.send("Are you sure you want to update your existing loadout: `{}`?".format(name))
+                start_adding_reactions(msg, ReactionPredicate.YES_OR_NO_EMOJIS)
+                pred = ReactionPredicate.yes_or_no(msg, ctx.author)
                 try:
-                    c = await Character.from_json(self.config, ctx.author)
-                except Exception as exc:
-                    log.exception("Error with the new character sheet", exc_info=exc)
+                    await ctx.bot.wait_for("reaction_add", check=pred, timeout=60)
+                except asyncio.TimeoutError:
+                    await self._clear_react(msg)
                     return
-                loadout = await Character.save_loadout(c)
-                c.loadouts[name] = loadout
-                await self.config.user(ctx.author).set(await c.to_json(self.config))
-                await smart_embed(
-                    ctx,
-                    _("**{author}**, your current equipment has been saved to {name}.").format(
-                        author=self.escape(ctx.author.display_name), name=name
-                    ),
-                )
+
+                if not pred.result:
+                    await ctx.send("I will not updated loadout: `{}`.".format(name))
+                    return
+            loadout = await Character.save_loadout(c)
+            c.loadouts[name] = loadout
+            await self.config.user(ctx.author).set(await c.to_json(self.config))
+            await smart_embed(
+                ctx,
+                _("**{author}**, your current equipment has been saved to {name}.").format(
+                    author=self.escape(ctx.author.display_name), name=name
+                ),
+            )
 
     @loadout.command(name="delete", aliases=["del", "rem", "remove"])
-    async def remove_loadout(self, ctx: Context, name: str):
+    async def remove_loadout(self, ctx: commands.Context, name: str):
         """Delete a saved loadout."""
         if not await self.allow_in_dm(ctx):
             return await smart_embed(ctx, _("This command is not available in DM's on this bot."))
         async with self.get_lock(ctx.author):
             name = name.lower()
             try:
-                c = await Character.from_json(self.config, ctx.author)
+                c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 return
@@ -1562,7 +2022,6 @@ class Adventure(BaseCog):
                         author=self.escape(ctx.author.display_name), name=name
                     ),
                 )
-                return
             else:
                 del c.loadouts[name]
                 await self.config.user(ctx.author).set(await c.to_json(self.config))
@@ -1575,12 +2034,12 @@ class Adventure(BaseCog):
 
     @loadout.command(name="show")
     @commands.bot_has_permissions(add_reactions=True)
-    async def show_loadout(self, ctx: Context, name: str = None):
+    async def show_loadout(self, ctx: commands.Context, name: str = None):
         """Show saved loadouts."""
         if not await self.allow_in_dm(ctx):
             return await smart_embed(ctx, _("This command is not available in DM's on this bot."))
         try:
-            c = await Character.from_json(self.config, ctx.author)
+            c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
         except Exception as exc:
             log.exception("Error with the new character sheet", exc_info=exc)
             return
@@ -1605,8 +2064,8 @@ class Adventure(BaseCog):
             for (l_name, loadout) in c.loadouts.items():
                 if name and name.lower() == l_name:
                     index = count
-                stats = await self._build_loadout_display({"items": loadout})
-                msg = _("[{name} Loadout for {author}]\n\n{stats}").format(
+                stats = await self._build_loadout_display({"items": loadout}, rebirths=c.rebirths, index=count + 1)
+                msg = _("{name} Loadout for {author}\n\n{stats}").format(
                     name=l_name, author=self.escape(ctx.author.display_name), stats=stats
                 )
                 msg_list.append(box(msg, lang="css"))
@@ -1615,23 +2074,23 @@ class Adventure(BaseCog):
 
     @loadout.command(name="equip", aliases=["load"], cooldown_after_parsing=True)
     @commands.cooldown(rate=1, per=600, type=commands.BucketType.user)
-    async def equip_loadout(self, ctx: Context, name: str):
+    async def equip_loadout(self, ctx: commands.Context, name: str):
         """Equip a saved loadout."""
         if self.in_adventure(ctx):
+            ctx.command.reset_cooldown(ctx)
             return await smart_embed(
-                ctx,
-                _(
-                    "You tried to magically equip multiple items at once, but the monster ahead nearly killed you."
-                ),
+                ctx, _("You tried to magically equip multiple items at once, but the monster ahead nearly killed you."),
             )
         if not await self.allow_in_dm(ctx):
+            ctx.command.reset_cooldown(ctx)
             return await smart_embed(ctx, _("This command is not available in DM's on this bot."))
         name = name.lower()
         async with self.get_lock(ctx.author):
             try:
-                c = await Character.from_json(self.config, ctx.author)
+                c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
+                ctx.command.reset_cooldown(ctx)
                 return
             if name not in c.loadouts:
                 ctx.command.reset_cooldown(ctx)
@@ -1643,6 +2102,13 @@ class Adventure(BaseCog):
                 )
             else:
                 c = await c.equip_loadout(name)
+                await self.config.user(ctx.author).set(await c.to_json(self.config))
+                try:
+                    c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
+                except Exception as exc:
+                    log.exception("Error with the new character sheet", exc_info=exc)
+                    ctx.command.reset_cooldown(ctx)
+                    return
                 current_stats = box(
                     _(
                         "{author}'s new stats: "
@@ -1665,16 +2131,15 @@ class Adventure(BaseCog):
                     lang="css",
                 )
                 await ctx.send(current_stats)
-                await self.config.user(ctx.author).set(await c.to_json(self.config))
 
     @commands.group()
     @commands.guild_only()
-    async def adventureset(self, ctx: Context):
+    async def adventureset(self, ctx: commands.Context):
         """Setup various adventure settings."""
 
     @adventureset.command()
     @check_global_setting_admin()
-    async def rebirthcost(self, ctx: Context, percentage: float):
+    async def rebirthcost(self, ctx: commands.Context, percentage: float):
         """[Admin] Set what percentage of the user balance to charge for rebirths.
 
         Unless the user's balance is under 1k, users that rebirth will be left with the base of 1k credits plus the remaining credit percentage after the rebirth charge.
@@ -1684,70 +2149,200 @@ class Adventure(BaseCog):
         if not await bank.is_global():
             await self.config.guild(ctx.guild).rebirth_cost.set(percentage)
             await smart_embed(
-                ctx,
-                _("I will now charge {0:.0%} of the user's balance for a rebirth.").format(
-                    percentage / 100
-                ),
+                ctx, _("I will now charge {0:.0%} of the user's balance for a rebirth.").format(percentage / 100),
             )
         else:
             await self.config.rebirth_cost.set(percentage)
             await smart_embed(
                 ctx,
-                _("I will now charge {0:.0%} of the user's global balance for a rebirth.").format(
-                    percentage / 100
-                ),
+                _("I will now charge {0:.0%} of the user's global balance for a rebirth.").format(percentage / 100),
             )
 
     @adventureset.command()
-    @checks.admin_or_permissions(administrator=True)
-    async def cartroom(self, ctx: Context, room: discord.TextChannel = None):
+    @commands.admin_or_permissions(administrator=True)
+    async def cartroom(self, ctx: commands.Context, room: discord.TextChannel = None):
         """[Admin] Lock carts to a specific text channel."""
         if room is None:
-            return await smart_embed(
-                ctx, _("Done, carts will be able to appear in any text channel the bot can see.")
-            )
+            await self.config.guild(ctx.guild).cartroom.set(None)
+            return await smart_embed(ctx, _("Done, carts will be able to appear in any text channel the bot can see."))
 
         await self.config.guild(ctx.guild).cartroom.set(room.id)
-        await smart_embed(
-            ctx, _("Done, carts will only appear in {room.mention}.").format(room=room)
-        )
+        await smart_embed(ctx, _("Done, carts will only appear in {room.mention}.").format(room=room))
 
     @adventureset.group(name="locks")
     @commands.bot_has_permissions(add_reactions=True)
-    @checks.admin_or_permissions(administrator=True)
-    async def adventureset_locks(self, ctx: Context):
+    @commands.admin_or_permissions(administrator=True)
+    async def adventureset_locks(self, ctx: commands.Context):
         """[Admin] Reset Adventure locks."""
 
     @adventureset_locks.command(name="user")
-    async def adventureset_locks_user(self, ctx: Context, user: discord.member):
-        """[Admin] Reset a guild member's user lock."""
-        lock = self.get_lock(user)
-        with contextlib.suppress(Exception):
-            lock.release()
+    @commands.is_owner()
+    async def adventureset_locks_user(self, ctx: commands.Context, users: commands.Greedy[discord.User]):
+        """[Owner] Reset a multiple adventurers lock."""
+        for user in users:
+            lock = self.get_lock(user)
+            with contextlib.suppress(Exception):
+                lock.release()
         await ctx.tick()
+
+    @adventureset.command(name="dailybonus")
+    @commands.is_owner()
+    async def adventureset_daily_bonus(self, ctx: commands.Context, day: DayConverter, percentage: PercentageConverter):
+        """[Owner] Set the daily xp and currency bonus.
+
+        **percentage** must be between 0% and 100%.
+        """
+        day_val, day_text = day
+        async with self.config.daily_bonus.all() as daily_bonus_data:
+            daily_bonus_data[day_val] = percentage
+            self._daily_bonus = daily_bonus_data.copy()
+        await smart_embed(
+            ctx, _("Daily bonus for `{0}` has been set to: {1:.0%}").format(day_text.title(), percentage),
+        )
 
     @commands.guild_only()
     @adventureset_locks.command(name="adventure")
-    async def adventureset_locks_adventure(self, ctx: Context):
+    async def adventureset_locks_adventure(self, ctx: commands.Context):
         """[Admin] Reset the adventure game lock for the server."""
         while ctx.guild.id in self._sessions:
             del self._sessions[ctx.guild.id]
         await ctx.tick()
 
+    async def _garbage_collection(self):
+        await self.bot.wait_until_red_ready()
+        delta = timedelta(minutes=6)
+        with contextlib.suppress(asyncio.CancelledError):
+            while True:
+                async for guild_id, session in AsyncIter(self._sessions.copy(), steps=100):
+                    if session.start_time + delta > datetime.now():
+                        if guild_id in self._sessions:
+                            del self._sessions[guild_id]
+                await asyncio.sleep(5)
+
     @adventureset.command()
-    @checks.is_owner()
-    async def restrict(self, ctx: Context):
+    @commands.is_owner()
+    async def restrict(self, ctx: commands.Context):
         """[Owner] Set whether or not adventurers are restricted to one adventure at a time."""
         toggle = await self.config.restrict()
         await self.config.restrict.set(not toggle)
+        await smart_embed(ctx, _("Adventurers restricted to one adventure at a time: {}").format(not toggle))
+
+    @adventureset.command()
+    @commands.is_owner()
+    async def easymode(self, ctx: commands.Context):
+        """[Owner] Set whether or not Adventure will be in easy mode.
+
+        Easy mode gives less rewards, but monster information is shown.
+        """
+        toggle = await self.config.easy_mode()
+        await self.config.easy_mode.set(not toggle)
+        await smart_embed(ctx, _("Adventure easy mode is now **{}**.").format("Enabled" if not toggle else "Disabled"))
+
+    @adventureset.command()
+    @commands.is_owner()
+    async def sepcurrency(self, ctx: commands.Context):
+        """[Owner] Toggle whether the currency should be separated from main bot currency."""
+        toggle = await self.config.separate_economy()
+        await self.config.separate_economy.set(not toggle)
+        self._separate_economy = not toggle
         await smart_embed(
-            ctx, _("Adventurers restricted to one adventure at a time: {}").format(not toggle)
+            ctx, _("Adventurer currency is: **{}**").format(_("Separated" if not toggle else _("Unified")))
+        )
+
+    @adventureset.group(name="economy")
+    @check_global_setting_admin()
+    @commands.guild_only()
+    @has_separated_economy()
+    async def commands_adventureset_economy(self, ctx: commands.Context):
+        """[Admin] Manages the adventure economy."""
+
+    @commands_adventureset_economy.command(name="tax", usage="<gold,tax ...>")
+    @commands.is_owner()
+    async def commands_adventureset_economy_tax(self, ctx: commands.Context, *, taxes: TaxesConverter):
+        """[Owner] Set the tax thresholds.
+
+        **gold** must be positive
+        **tax** must be between 0 and 1.
+
+        Example: `[p]adventureset economy tax 10000,0.1 20000,0.2 ...`
+
+        """
+        new_taxes = {}
+        for k, v in taxes.items():
+            if int(k) >= 0 and 0 <= float(v) <= 1:
+                new_taxes[k] = float(v)
+        new_taxes = {k: v for k, v in sorted(new_taxes.items(), key=lambda item: item[1])}
+        await self.config.tax_brackets.set(new_taxes)
+
+        taxes = await self.config.tax_brackets()
+        table = BeautifulTable(default_alignment=ALIGN_LEFT, maxwidth=500)
+        table.set_style(BeautifulTable.STYLE_RST)
+        table.columns.header = ["Tax %", "Tax Threshold"]
+        for k, v in taxes.items():
+            table.rows.append((f"[{v:.2%}]", humanize_number(int(k))))
+        table.rows.sort("Tax %", reverse=True)
+        await smart_embed(ctx, box(str(table), lang="css",))
+
+    @commands.is_owner()
+    @commands_adventureset_economy.command(name="rate")
+    async def commands_adventureset_economy_conversion_rate(self, ctx: commands.Context, rate_in: int, rate_out: int):
+        """[Owner] Set how much 1 bank credit is worth in adventure.
+
+        **rate_in**: Is how much gold you will get for 1 bank credit. Default is 10
+        **rate_out**: Is how much gold is needed to convert to 1 bank credit. Default is 11
+        """
+        if rate_in < 0 or rate_out < 0:
+            return await smart_embed(ctx, _("You are evil ... please DM me your phone number we need to hangout."))
+        await self.config.to_conversion_rate.set(rate_in)
+        await self.config.from_conversion_rate.set(rate_out)
+        await smart_embed(
+            ctx,
+            _("1 {name} will be worth {rate_in} {a_name}.\n{rate_out} {a_name} will convert into 1 {name}").format(
+                name=await bank.get_currency_name(ctx.guild, _forced=True),
+                rate_in=humanize_number(rate_in),
+                rate_out=humanize_number(rate_out),
+                a_name=await bank.get_currency_name(ctx.guild),
+            ),
+        )
+
+    @commands_adventureset_economy.command(name="maxwithdraw")
+    async def commands_adventureset_economy_maxwithdraw(self, ctx: commands.Context, *, amount: int):
+        """[Admin] Set how much players are allowed to withdraw."""
+        if amount < 0:
+            return await smart_embed(ctx, _("You are evil ... please DM me your phone number we need to hangout."))
+        if await bank.is_global(_forced=True):
+            await self.config.max_allowed_withdraw.set(amount)
+        else:
+            await self.config.guild(ctx.guild).max_allowed_withdraw.set(amount)
+        await smart_embed(
+            ctx,
+            _(
+                "Adventurers will be able to withdraw up to {amount} {name} from their adventure bank and deposit into their bot economy."
+            ).format(name=await bank.get_currency_name(ctx.guild, _forced=True), amount=humanize_number(amount),),
+        )
+
+    @commands_adventureset_economy.command(name="withdraw")
+    async def commands_adventureset_economy_withdraw(self, ctx: commands.Context):
+        """[Admin] Toggle whether users are allowed to withdraw from adventure currency to main currency."""
+
+        if await bank.is_global(_forced=True):
+            state = await self.config.disallow_withdraw()
+            await self.config.disallow_withdraw.set(not state)
+        else:
+            state = await self.config.guild(ctx.guild).disallow_withdraw()
+            await self.config.guild(ctx.guild).disallow_withdraw.set(not state)
+
+        await smart_embed(
+            ctx,
+            _("Adventurers are now {state} to withdraw money from adventure currency.").format(
+                state=_("allowed") if not state else _("disallowed")
+            ),
         )
 
     @adventureset.command(name="advcooldown", hidden=True)
-    @checks.admin_or_permissions(administrator=True)
+    @commands.admin_or_permissions(administrator=True)
     @commands.guild_only()
-    async def advcooldown(self, ctx: Context, *, time_in_seconds: int):
+    async def advcooldown(self, ctx: commands.Context, *, time_in_seconds: int):
         """[Admin] Changes the cooldown/gather time after an adventure.
 
         Default is 120 seconds.
@@ -1757,81 +2352,82 @@ class Adventure(BaseCog):
 
         await self.config.guild(ctx.guild).cooldown_timer_manual.set(time_in_seconds)
         await smart_embed(
-            ctx,
-            _("Adventure cooldown set to {cooldown} seconds.").format(cooldown=time_in_seconds),
+            ctx, _("Adventure cooldown set to {cooldown} seconds.").format(cooldown=time_in_seconds),
         )
 
     @adventureset.command()
-    async def version(self, ctx: Context):
+    async def version(self, ctx: commands.Context):
         """Display the version of adventure being used."""
         await ctx.send(box(_("Adventure version: {}").format(self.__version__)))
 
     @adventureset.command()
-    @checks.admin_or_permissions(administrator=True)
-    async def god(self, ctx: Context, *, name):
+    @commands.admin_or_permissions(administrator=True)
+    async def god(self, ctx: commands.Context, *, name):
         """[Admin] Set the server's name of the god."""
         await self.config.guild(ctx.guild).god_name.set(name)
         await ctx.tick()
 
     @adventureset.command()
-    @checks.is_owner()
-    async def globalgod(self, ctx: Context, *, name):
+    @commands.is_owner()
+    async def globalgod(self, ctx: commands.Context, *, name):
         """[Owner] Set the default name of the god."""
         await self.config.god_name.set(name)
         await ctx.tick()
 
     @adventureset.command(aliases=["embed"])
-    @checks.admin_or_permissions(administrator=True)
-    async def embeds(self, ctx: Context):
+    @commands.admin_or_permissions(administrator=True)
+    async def embeds(self, ctx: commands.Context):
         """[Admin] Set whether or not to use embeds for the adventure game."""
         toggle = await self.config.guild(ctx.guild).embed()
         await self.config.guild(ctx.guild).embed.set(not toggle)
         await smart_embed(ctx, _("Embeds: {}").format(not toggle))
 
     @adventureset.command(aliases=["chests"])
-    @checks.is_owner()
-    async def cartchests(self, ctx: Context):
+    @commands.is_owner()
+    async def cartchests(self, ctx: commands.Context):
         """[Admin] Set whether or not to sell chests in the cart."""
         toggle = await self.config.enable_chests()
         await self.config.enable_chests.set(not toggle)
         await smart_embed(ctx, _("Carts can sell chests: {}").format(not toggle))
 
     @adventureset.command()
-    @checks.admin_or_permissions(administrator=True)
-    async def cartname(self, ctx: Context, *, name):
+    @commands.admin_or_permissions(administrator=True)
+    async def cartname(self, ctx: commands.Context, *, name):
         """[Admin] Set the server's name of the cart."""
         await self.config.guild(ctx.guild).cart_name.set(name)
         await ctx.tick()
 
     @adventureset.command()
-    @checks.admin_or_permissions(administrator=True)
-    async def carttime(self, ctx: Context, *, time: str):
-        """[Admin] Set the cooldown of the cart."""
+    @commands.admin_or_permissions(administrator=True)
+    async def carttime(self, ctx: commands.Context, *, time: str):
+        """
+        [Admin] Set the cooldown of the cart.
+        Time can be in seconds, minutes, hours, or days.
+        Examples: `1h 30m`, `2 days`, `300`
+        The bot assumes seconds if no units are given.
+        """
         time_delta = parse_timedelta(time)
         if time_delta is None:
-            return await smart_embed(
-                ctx, _("You must supply a amount and time unit like `120 seconds`.")
-            )
+            return await smart_embed(ctx, _("You must supply a amount and time unit like `120 seconds`."))
         if time_delta.total_seconds() < 600:
             cartname = await self.config.guild(ctx.guild).cart_name()
             if not cartname:
                 cartname = await self.config.cart_name()
-            return await smart_embed(
-                ctx, _("{} doesn't have the energy to return that often.").format(cartname)
-            )
-        await self.config.guild(ctx.guild).cart_timeout.set(time_delta.seconds)
+            return await smart_embed(ctx, _("{} doesn't have the energy to return that often.").format(cartname))
+        await self.config.guild(ctx.guild).cart_timeout.set(time_delta.total_seconds())
         await ctx.tick()
 
     @adventureset.command(name="clear")
-    @checks.is_owner()
-    async def clear_user(self, ctx: Context, *, user: discord.User):
-        """[Owner] Lets you clear a users entire character sheet."""
-        await self.config.user(user).clear()
-        await smart_embed(ctx, _("{user}'s character sheet has been erased.").format(user=user))
+    @commands.is_owner()
+    async def clear_user(self, ctx: commands.Context, *, users: commands.Greedy[discord.User]):
+        """[Owner] Lets you clear multiple users character sheets."""
+        for user in users:
+            await self.config.user(user).clear()
+            await smart_embed(ctx, _("{user}'s character sheet has been erased.").format(user=user))
 
     @adventureset.command(name="remove")
-    @checks.is_owner()
-    async def remove_item(self, ctx: Context, user: discord.Member, *, full_item_name: str):
+    @commands.is_owner()
+    async def remove_item(self, ctx: commands.Context, user: discord.User, *, full_item_name: str):
         """[Owner] Lets you remove an item from a user.
 
         Use the full name of the item including the rarity characters like . or []  or {}.
@@ -1839,7 +2435,7 @@ class Adventure(BaseCog):
         async with self.get_lock(user):
             item = None
             try:
-                c = await Character.from_json(self.config, user)
+                c = await Character.from_json(self.config, user, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 return
@@ -1862,20 +2458,18 @@ class Adventure(BaseCog):
             with contextlib.suppress(KeyError):
                 del c.backpack[item.name]
             await self.config.user(user).set(await c.to_json(self.config))
-        await ctx.send(
-            _("{item} removed from {user}.").format(item=box(str(item), lang="css"), user=user)
-        )
+        await ctx.send(_("{item} removed from {user}.").format(item=box(str(item), lang="css"), user=user))
 
     @adventureset.command()
-    @checks.is_owner()
-    async def globalcartname(self, ctx: Context, *, name):
+    @commands.is_owner()
+    async def globalcartname(self, ctx: commands.Context, *, name):
         """[Owner] Set the default name of the cart."""
         await self.config.cart_name.set(name)
         await ctx.tick()
 
     @adventureset.command()
-    @checks.is_owner()
-    async def theme(self, ctx: Context, *, theme):
+    @commands.is_owner()
+    async def theme(self, ctx: commands.Context, *, theme):
         """[Owner] Change the theme for adventure."""
         if theme == "default":
             await self.config.theme.set("default")
@@ -1904,10 +2498,7 @@ class Adventure(BaseCog):
 
         if missing_files:
             await smart_embed(
-                ctx,
-                _("That theme pack is missing the following files: {}.").format(
-                    humanize_list(missing_files)
-                ),
+                ctx, _("That theme pack is missing the following files: {}.").format(humanize_list(missing_files)),
             )
             return
         else:
@@ -1917,20 +2508,20 @@ class Adventure(BaseCog):
 
     @commands.group()
     @commands.guild_only()
-    @checks.admin_or_permissions(administrator=True)
-    async def themeset(self, ctx: Context):
+    @commands.admin_or_permissions(administrator=True)
+    async def themeset(self, ctx: commands.Context):
         """[Admin] Modify themes."""
 
-    @checks.is_owner()
+    @commands.is_owner()
     @themeset.group(name="add")
-    async def themeset_add(self, ctx: Context):
+    async def themeset_add(self, ctx: commands.Context):
         """[Owner] Add/Update objects in the specified theme."""
 
     @themeset_add.command(name="monster")
-    async def themeset_add_monster(self, ctx: Context, *, theme_data: ThemeSetMonterConverter):
+    async def themeset_add_monster(self, ctx: commands.Context, *, theme_data: ThemeSetMonterConverter):
         """[Owner] Add/Update a monster object in the specified theme.
 
-        Usage: `[p]themeset add monster theme++name++hp++dipl++pdef++mdef++boss++image`
+        Usage: `[p]themeset add monster theme++name++hp++dipl++pdef++mdef++cdef++boss++image`
         """
         assert isinstance(theme_data, dict)
         theme = theme_data.pop("theme", None)
@@ -1951,24 +2542,20 @@ class Adventure(BaseCog):
         text = _(
             "Monster: `{monster}` has been {status} the `{theme}` theme\n"
             "```ini\n"
-            "HP:               [{hp}]\n"
-            "Diplomacy:        [{dipl}]\n"
-            "Physical defence: [{pdef}]\n"
-            "Magical defence:  [{mdef}]\n"
-            "Is a boss:        [{boss}]```"
-        ).format(
-            monster=monster,
-            theme=theme,
-            status=_("added to") if not updated else _("updated in"),
-            **theme_data,
-        )
+            "HP:                  [{hp}]\n"
+            "Diplomacy:           [{dipl}]\n"
+            "Physical defence:    [{pdef}]\n"
+            "Magical defence:     [{mdef}]\n"
+            "Persuasion defence:  [{cdef}]\n"
+            "Is a boss:           [{boss}]```"
+        ).format(monster=monster, theme=theme, status=_("added to") if not updated else _("updated in"), **theme_data,)
 
         embed = discord.Embed(description=text, colour=await ctx.embed_colour())
         embed.set_image(url=image)
         await ctx.send(embed=embed)
 
     @themeset_add.command(name="pet")
-    async def themeset_add_pet(self, ctx: Context, *, pet_data: ThemeSetPetConverter):
+    async def themeset_add_pet(self, ctx: commands.Context, *, pet_data: ThemeSetPetConverter):
         """[Owner] Add/Update a pet object in the specified theme.
 
         Usage: `[p]themeset add pet theme++name++bonus_multiplier++required_cha++crit_chance++always_crit`
@@ -1998,23 +2585,19 @@ class Adventure(BaseCog):
             "Pet always crits:  [{always}]\n"
             "Critical Chance:   [{crit}/100]```"
         ).format(
-            pet=pet,
-            theme=theme,
-            status=_("added to") if not updated else _("updated in"),
-            **pet_data,
-            **pet_bonuses,
+            pet=pet, theme=theme, status=_("added to") if not updated else _("updated in"), **pet_data, **pet_bonuses,
         )
 
         embed = discord.Embed(description=text, colour=await ctx.embed_colour())
         await ctx.send(embed=embed)
 
-    @checks.is_owner()
+    @commands.is_owner()
     @themeset.group(name="delete", aliases=["del", "rem", "remove"])
-    async def themeset_delete(self, ctx: Context):
+    async def themeset_delete(self, ctx: commands.Context):
         """[Owner] Remove objects in the specified theme."""
 
     @themeset_delete.command(name="monster")
-    async def themeset_delete_monster(self, ctx: Context, theme: str, *, monster: str):
+    async def themeset_delete_monster(self, ctx: commands.Context, theme: str, *, monster: str):
         """[Owner] Remove a monster object in the specified theme."""
         if theme != "default" and theme not in os.listdir(cog_data_path(self)):
             await smart_embed(ctx, _("That theme pack does not exist!"))
@@ -2027,19 +2610,15 @@ class Adventure(BaseCog):
             if monster in config_data[theme]["monsters"]:
                 del config_data[theme]["monsters"][monster]
             else:
-                text = _("Monster: `{monster}` does not exist in `{theme}` theme").format(
-                    monster=monster, theme=theme
-                )
+                text = _("Monster: `{monster}` does not exist in `{theme}` theme").format(monster=monster, theme=theme)
                 await smart_embed(ctx, text)
                 return
 
-        text = _("Monster: `{monster}` has been deleted from the `{theme}` theme").format(
-            monster=monster, theme=theme
-        )
+        text = _("Monster: `{monster}` has been deleted from the `{theme}` theme").format(monster=monster, theme=theme)
         await smart_embed(ctx, text)
 
     @themeset_delete.command(name="pet")
-    async def themeset_delete_pet(self, ctx: Context, theme: str, *, pet: str):
+    async def themeset_delete_pet(self, ctx: commands.Context, theme: str, *, pet: str):
         """[Owner] Remove a pet object in the specified theme."""
         if theme != "default" and theme not in os.listdir(cog_data_path(self)):
             await smart_embed(ctx, _("That theme pack does not exist!"))
@@ -2052,23 +2631,19 @@ class Adventure(BaseCog):
             if pet in config_data[theme]["pet"]:
                 del config_data[theme]["pet"][pet]
             else:
-                text = _("Pet: `{pet}` does not exist in `{theme}` theme").format(
-                    pet=pet, theme=theme
-                )
+                text = _("Pet: `{pet}` does not exist in `{theme}` theme").format(pet=pet, theme=theme)
                 await smart_embed(ctx, text)
                 return
 
-        text = _("Pet: `{pet}` has been deleted from the `{theme}` theme").format(
-            pet=pet, theme=theme
-        )
+        text = _("Pet: `{pet}` has been deleted from the `{theme}` theme").format(pet=pet, theme=theme)
         await smart_embed(ctx, text)
 
     @themeset.group(name="list", aliases=["show"])
-    async def themeset_list(self, ctx: Context):
+    async def themeset_list(self, ctx: commands.Context):
         """[Admin] Show custom objects in the specified theme."""
 
     @themeset_list.command(name="monster")
-    async def themeset_list_monster(self, ctx: Context, *, theme: str):
+    async def themeset_list_monster(self, ctx: commands.Context, *, theme: str):
         """[Admin] Show monster objects in the specified theme."""
         if theme != "default" and theme not in os.listdir(cog_data_path(self)):
             await smart_embed(ctx, _("That theme pack does not exist!"))
@@ -2080,13 +2655,15 @@ class Adventure(BaseCog):
         embed_list = []
         for monster, monster_stats in monster_data.items():
             image = monster_stats.get("image")
+            monster_stats["cdef"] = monster_stats.get("cdef", 1.0)
             text = _(
                 "```ini\n"
-                "HP:               [{hp}]\n"
-                "Diplomacy:        [{dipl}]\n"
-                "Physical defence: [{pdef}]\n"
-                "Magical defence:  [{mdef}]\n"
-                "Is a boss:        [{boss}]```"
+                "HP:                  [{hp}]\n"
+                "Diplomacy:           [{dipl}]\n"
+                "Physical defence:    [{pdef}]\n"
+                "Magical defence:     [{mdef}]\n"
+                "Persuasion defence:  [{cdef}]\n"
+                "Is a boss:           [{boss}]```"
             ).format(**monster_stats)
             embed = discord.Embed(title=monster, description=text)
             embed.set_image(url=image)
@@ -2095,7 +2672,7 @@ class Adventure(BaseCog):
             await menu(ctx, embed_list, DEFAULT_CONTROLS)
 
     @themeset_list.command(name="pet")
-    async def themeset_list_pet(self, ctx: Context, *, theme: str):
+    async def themeset_list_pet(self, ctx: commands.Context, *, theme: str):
         """[Admin] Show pet objects in the specified theme."""
         if theme != "default" and theme not in os.listdir(cog_data_path(self)):
             await smart_embed(ctx, _("That theme pack does not exist!"))
@@ -2120,13 +2697,13 @@ class Adventure(BaseCog):
             await menu(ctx, embed_list, DEFAULT_CONTROLS)
 
     @adventureset.command()
-    @checks.admin_or_permissions(administrator=True)
+    @commands.admin_or_permissions(administrator=True)
     @commands.guild_only()
-    async def cart(self, ctx: Context, *, channel: discord.TextChannel = None):
+    async def cart(self, ctx: commands.Context, *, channel: discord.TextChannel = None):
         """[Admin] Add or remove a text channel that the Trader cart can appear in.
 
-        If the channel is already in the list, it will be removed. Use `[p]adventureset cart` with
-        no arguments to show the channel list.
+        If the channel is already in the list, it will be removed.
+        Use `[p]adventureset cart` with no arguments to show the channel list.
         """
 
         channel_list = await self.config.guild(ctx.guild).cart_channels()
@@ -2145,20 +2722,84 @@ class Adventure(BaseCog):
         elif channel.id in channel_list:
             new_channels = channel_list.remove(channel.id)
             await smart_embed(
-                ctx,
-                _("The {} channel has been removed from the cart delivery list.").format(channel),
+                ctx, _("The {} channel has been removed from the cart delivery list.").format(channel),
             )
             return await self.config.guild(ctx.guild).cart_channels.set(new_channels)
         else:
             channel_list.append(channel.id)
-            await smart_embed(
-                ctx, _("The {} channel has been added to the cart delivery list.").format(channel)
-            )
+            await smart_embed(ctx, _("The {} channel has been added to the cart delivery list.").format(channel))
             await self.config.guild(ctx.guild).cart_channels.set(channel_list)
+
+    @commands.guild_only()
+    @commands.command()
+    @commands.cooldown(rate=1, per=4, type=commands.BucketType.guild)
+    async def adventuresettings(self, ctx: commands.Context):
+        """Display current settings."""
+        global_data = await self.config.all()
+        guild_data = await self.config.guild(ctx.guild).all()
+
+        theme = global_data["theme"]
+        god_name = global_data["god_name"] if not guild_data["god_name"] else guild_data["god_name"]
+        cart_trader_name = global_data["cart_name"] if not guild_data["cart_name"] else guild_data["cart_name"]
+
+        cart_channel_ids = guild_data["cart_channels"]
+        if cart_channel_ids:
+            cart_channels = humanize_list([f"{self.bot.get_channel(x).name}" for x in cart_channel_ids])
+        else:
+            cart_channels = _("None")
+
+        cart_channel_lock_override_id = guild_data["cartroom"]
+        if cart_channel_lock_override_id:
+            cclo_channel_obj = self.bot.get_channel(cart_channel_lock_override_id)
+            cart_channel_lock_override = f"{cclo_channel_obj.name}"
+        else:
+            cart_channel_lock_override = _("No channel lock present.")
+
+        cart_timeout = parse_timedelta(f"{guild_data['cart_timeout']} seconds")
+        lootbox_in_carts = _("Allowed") if global_data["enable_chests"] else _("Not allowed")
+
+        if not await bank.is_global():
+            rebirth_cost = guild_data["rebirth_cost"]
+        else:
+            rebirth_cost = global_data["rebirth_cost"]
+        rebirth_cost = _("{0:.0%} of bank balance").format(rebirth_cost / 100)
+
+        single_adventure_restrict = _("Restricted") if global_data["restrict"] else _("Unlimited")
+        adventure_in_embed = _("Allow embeds") if guild_data["embed"] else _("No embeds")
+        time_after_adventure = parse_timedelta(f"{guild_data['cooldown_timer_manual']} seconds")
+
+        msg = _("Adventure Settings\n\n")
+        msg += _("# Main Settings\n")
+        msg += _("[Theme]:                                {theme}\n").format(theme=theme)
+        msg += _("[God name]:                             {god_name}\n").format(god_name=god_name)
+        msg += _("[Base rebirth cost]:                    {rebirth_cost}\n").format(rebirth_cost=rebirth_cost)
+        msg += _("[Adventure message style]:              {adventure_in_embed}\n").format(
+            adventure_in_embed=adventure_in_embed
+        )
+        msg += _("[Multi-adventure restriction]:          {single_adventure_restrict}\n").format(
+            single_adventure_restrict=single_adventure_restrict
+        )
+        msg += _("[Post-adventure cooldown (hh:mm:ss)]:   {time_after_adventure}\n\n").format(
+            time_after_adventure=time_after_adventure
+        )
+        msg += _("# Cart Settings\n")
+        msg += _("[Cart trader name]:                     {cart_trader_name}\n").format(
+            cart_trader_name=cart_trader_name
+        )
+        msg += _("[Cart delivery channels]:               {cart_channels}\n").format(cart_channels=cart_channels)
+        msg += _("[Cart channel lock override]:           {cart_channel_lock_override}\n").format(
+            cart_channel_lock_override=cart_channel_lock_override
+        )
+        msg += _("[Cart timeout (hh:mm:ss)]:              {cart_timeout}\n").format(cart_timeout=cart_timeout)
+        msg += _("[Lootboxes in carts]:                   {lootbox_in_carts}\n").format(
+            lootbox_in_carts=lootbox_in_carts
+        )
+
+        await ctx.send(box(msg, lang="ini"))
 
     @commands.command()
     @commands.cooldown(rate=1, per=4, type=commands.BucketType.guild)
-    async def convert(self, ctx: Context, box_rarity: str, amount: int = 1):
+    async def convert(self, ctx: commands.Context, box_rarity: str, amount: int = 1):
         """Convert normal, rare or epic chests.
 
         Trade 25 normal chests for 1 rare chest.
@@ -2171,7 +2812,8 @@ class Adventure(BaseCog):
             return await smart_embed(
                 ctx,
                 _(
-                    "You tried to magically combine some of your loot chests but the monster ahead is commanding your attention."
+                    "You tried to magically combine some of your loot chests "
+                    "but the monster ahead is commanding your attention."
                 ),
             )
         normalcost = 25
@@ -2188,7 +2830,7 @@ class Adventure(BaseCog):
             plural = ""
         async with self.get_lock(ctx.author):
             try:
-                c = await Character.from_json(self.config, ctx.author)
+                c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 return
@@ -2196,23 +2838,21 @@ class Adventure(BaseCog):
             if box_rarity.lower() == "rare" and c.rebirths < rebirth_rare:
                 return await smart_embed(
                     ctx,
-                    (
-                        "**{}**, You need to have {} or more rebirths to convert rare treasure chests."
-                    ).format(self.escape(ctx.author.display_name), rebirth_rare),
+                    ("**{}**, you need to have {} or more rebirths to convert rare treasure chests.").format(
+                        self.escape(ctx.author.display_name), rebirth_rare
+                    ),
                 )
             elif box_rarity.lower() == "epic" and c.rebirths < rebirth_epic:
                 return await smart_embed(
                     ctx,
-                    (
-                        "**{}**, You need to have {} or more rebirths to convert epic treasure chests."
-                    ).format(self.escape(ctx.author.display_name), rebirth_epic),
+                    ("**{}**, you need to have {} or more rebirths to convert epic treasure chests.").format(
+                        self.escape(ctx.author.display_name), rebirth_epic
+                    ),
                 )
             elif c.rebirths < 2:
                 return await smart_embed(
                     ctx,
-                    _("**{c}**, you need to 3 rebirths to use this.").format(
-                        c=self.escape(ctx.author.display_name)
-                    ),
+                    _("**{c}**, you need to 3 rebirths to use this.").format(c=self.escape(ctx.author.display_name)),
                 )
 
             if box_rarity.lower() == "normal" and c.rebirths >= rebirth_normal:
@@ -2225,7 +2865,7 @@ class Adventure(BaseCog):
                                 "Successfully converted {converted} normal treasure "
                                 "chests to {to} rare treasure chest{plur}.\n{author} "
                                 "now owns {normal} normal, {rare} rare, {epic} epic, "
-                                "{leg} legendary treasure chests and {set} set treasure chests."
+                                "{leg} legendary treasure chests, {asc} ascended and {set} set treasure chests."
                             ).format(
                                 converted=humanize_number(normalcost * amount),
                                 to=humanize_number(1 * amount),
@@ -2235,7 +2875,8 @@ class Adventure(BaseCog):
                                 rare=c.treasure[1],
                                 epic=c.treasure[2],
                                 leg=c.treasure[3],
-                                set=c.treasure[4],
+                                asc=c.treasure[4],
+                                set=c.treasure[5],
                             ),
                             lang="css",
                         )
@@ -2244,12 +2885,8 @@ class Adventure(BaseCog):
                 else:
                     await smart_embed(
                         ctx,
-                        _(
-                            "**{author}**, you do not have {amount} "
-                            "normal treasure chests to convert."
-                        ).format(
-                            author=self.escape(ctx.author.display_name),
-                            amount=humanize_number(normalcost * amount),
+                        _("**{author}**, you do not have {amount} normal treasure chests to convert.").format(
+                            author=self.escape(ctx.author.display_name), amount=humanize_number(normalcost * amount),
                         ),
                     )
             elif box_rarity.lower() == "rare" and c.rebirths >= rebirth_rare:
@@ -2262,7 +2899,7 @@ class Adventure(BaseCog):
                                 "Successfully converted {converted} rare treasure "
                                 "chests to {to} epic treasure chest{plur}. \n{author} "
                                 "now owns {normal} normal, {rare} rare, {epic} epic, "
-                                "{leg} legendary treasure chests and {set} set treasure chests."
+                                "{leg} legendary treasure chests, {asc} ascended and {set} set treasure chests."
                             ).format(
                                 converted=humanize_number(rarecost * amount),
                                 to=humanize_number(1 * amount),
@@ -2272,7 +2909,8 @@ class Adventure(BaseCog):
                                 rare=c.treasure[1],
                                 epic=c.treasure[2],
                                 leg=c.treasure[3],
-                                set=c.treasure[4],
+                                asc=c.treasure[4],
+                                set=c.treasure[5],
                             ),
                             lang="css",
                         )
@@ -2281,10 +2919,7 @@ class Adventure(BaseCog):
                 else:
                     await smart_embed(
                         ctx,
-                        _(
-                            "{author}, you do not have {amount} "
-                            "rare treasure chests to convert."
-                        ).format(
+                        _("{author}, you do not have {amount} rare treasure chests to convert.").format(
                             author=ctx.author.mention, amount=humanize_number(rarecost * amount)
                         ),
                     )
@@ -2298,7 +2933,7 @@ class Adventure(BaseCog):
                                 "Successfully converted {converted} epic treasure "
                                 "chests to {to} legendary treasure chest{plur}. \n{author} "
                                 "now owns {normal} normal, {rare} rare, {epic} epic, "
-                                "{leg} legendary treasure chests and {set} set treasure chests."
+                                "{leg} legendary treasure chests, {asc} ascended and {set} set treasure chests."
                             ).format(
                                 converted=humanize_number(epiccost * amount),
                                 to=humanize_number(1 * amount),
@@ -2308,7 +2943,8 @@ class Adventure(BaseCog):
                                 rare=c.treasure[1],
                                 epic=c.treasure[2],
                                 leg=c.treasure[3],
-                                set=c.treasure[4],
+                                asc=c.treasure[4],
+                                set=c.treasure[5],
                             ),
                             lang="css",
                         )
@@ -2317,35 +2953,31 @@ class Adventure(BaseCog):
                 else:
                     await smart_embed(
                         ctx,
-                        _(
-                            "**{author}**, you do not have {amount} "
-                            "epic treasure chests to convert."
-                        ).format(
-                            author=self.escape(ctx.author.display_name),
-                            amount=humanize_number(epiccost * amount),
+                        _("**{author}**, you do not have {amount} epic treasure chests to convert.").format(
+                            author=self.escape(ctx.author.display_name), amount=humanize_number(epiccost * amount),
                         ),
                     )
             else:
                 await smart_embed(
                     ctx,
-                    _(
-                        "**{}**, please select between normal, rare, or epic treasure chests to convert."
-                    ).format(self.escape(ctx.author.display_name)),
+                    _("**{}**, please select between normal, rare, or epic treasure chests to convert.").format(
+                        self.escape(ctx.author.display_name)
+                    ),
                 )
 
     @commands.command()
-    async def equip(self, ctx: Context, *, item: ItemConverter):
+    async def equip(self, ctx: commands.Context, *, item: EquipableItemConverter):
         """This equips an item from your backpack."""
         if self.in_adventure(ctx):
             return await smart_embed(
-                ctx,
-                _("You tried to equip your item but the monster ahead nearly decapitated you."),
+                ctx, _("You tried to equip your item but the monster ahead nearly decapitated you."),
             )
         if not await self.allow_in_dm(ctx):
             return await smart_embed(ctx, _("This command is not available in DM's on this bot."))
 
         await ctx.invoke(self.backpack_equip, equip_item=item)
 
+    @commands.max_concurrency(1, per=commands.BucketType.user)
     @commands.command()
     @commands.bot_has_permissions(add_reactions=True)
     async def forge(self, ctx):
@@ -2354,69 +2986,67 @@ class Adventure(BaseCog):
         This allows a Tinkerer to forge two items into a device. (1h cooldown)
         """
         if self.in_adventure(ctx):
-            return await smart_embed(
-                ctx, _("You tried to forge an item but there were no forges nearby.")
-            )
+            return await smart_embed(ctx, _("You tried to forge an item but there were no forges nearby."))
         if not await self.allow_in_dm(ctx):
             return await smart_embed(ctx, _("This command is not available in DM's on this bot."))
         async with self.get_lock(ctx.author):
             try:
-                c = await Character.from_json(self.config, ctx.author)
+                c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 return
             if c.heroclass["name"] != "Tinkerer":
                 return await smart_embed(
                     ctx,
-                    _("**{}**, you need to be a Tinkerer to do this.").format(
-                        self.escape(ctx.author.display_name)
-                    ),
+                    _("**{}**, you need to be a Tinkerer to do this.").format(self.escape(ctx.author.display_name)),
                 )
             else:
-                cooldown_time = max(900, (3600 - (c.luck + c.total_int) * 2))
+                cooldown_time = max(1800, (7200 - max((c.luck + c.total_int) * 2, 0)))
                 if "cooldown" not in c.heroclass:
                     c.heroclass["cooldown"] = cooldown_time + 1
-                if not c.heroclass["cooldown"] + cooldown_time <= time.time():
-                    cooldown_time = (c.heroclass["cooldown"]) + cooldown_time - time.time()
+                if c.heroclass["cooldown"] > time.time():
+                    cooldown_time = c.heroclass["cooldown"] - time.time()
                     return await smart_embed(
                         ctx,
                         _("This command is on cooldown. Try again in {}").format(
-                            humanize_timedelta(seconds=int(cooldown_time))
-                            if cooldown_time >= 1
-                            else _("1 second")
+                            humanize_timedelta(seconds=int(cooldown_time)) if cooldown_time >= 1 else _("1 second")
                         ),
                     )
+                ascended_forge_msg = ""
+                ignored_rarities = ["forged", "set", "event"]
+                if c.rebirths < 30:
+                    ignored_rarities.append("ascended")
+                    ascended_forge_msg += _("\n\nAscended items will be forgeable after 30 rebirths.")
                 consumed = []
-                forgeables_items = [
-                    str(i) for n, i in c.backpack.items() if i.rarity not in ["forged", "set"]
-                ]
-
+                forgeables_items = [str(i) for n, i in c.backpack.items() if i.rarity not in ignored_rarities]
                 if len(forgeables_items) <= 1:
                     return await smart_embed(
                         ctx,
-                        _(
-                            "**{}**, you need at least two forgeable items in your backpack to forge."
-                        ).format(self.escape(ctx.author.display_name)),
+                        _("**{}**, you need at least two forgeable items in your backpack to forge.{}").format(
+                            self.escape(ctx.author.display_name), ascended_forge_msg
+                        ),
                     )
-                forgeables = _("[{author}'s forgeables]\n{bc}\n").format(
-                    author=self.escape(ctx.author.display_name), bc=c.get_backpack(True)
-                )
-                pages = pagify(forgeables, delims=["\n"], shorten_by=20, page_length=1900)
-                pages = [box(page, lang="css") for page in pages]
+                pages = await c.get_backpack(forging=True, clean=True)
+                if not pages:
+                    return await smart_embed(
+                        ctx,
+                        _("**{}**, you need at least two forgeable items in your backpack to forge.").format(
+                            self.escape(ctx.author.display_name)
+                        ),
+                    )
                 task = asyncio.create_task(menu(ctx, pages, DEFAULT_CONTROLS, timeout=180))
                 await smart_embed(
                     ctx,
                     _(
-                        "Reply with the full or partial name of item 1 to select for forging. Try to be specific. (Say `cancel` to exit)"
+                        "Reply with the full or partial name of item 1 to select for forging. "
+                        "Try to be specific. (Say `cancel` to exit){}".format(ascended_forge_msg)
                     ),
                 )
                 try:
                     item = None
                     while not item:
                         reply = await ctx.bot.wait_for(
-                            "message",
-                            check=MessagePredicate.same_context(user=ctx.author),
-                            timeout=30,
+                            "message", check=MessagePredicate.same_context(user=ctx.author), timeout=30,
                         )
                         new_ctx = await self.bot.get_context(reply)
                         if reply.content.lower() in ["cancel", "exit"]:
@@ -2427,10 +3057,16 @@ class Adventure(BaseCog):
                             item = await ItemConverter().convert(new_ctx, reply.content)
                             if str(item) not in forgeables_items:
                                 item = None
+
                         if not item:
-                            wrong_item = _(
-                                "**{c}**, I could not find that item - check your spelling."
-                            ).format(c=self.escape(ctx.author.display_name))
+                            wrong_item = _("**{c}**, I could not find that item - check your spelling.").format(
+                                c=self.escape(ctx.author.display_name)
+                            )
+                            await smart_embed(ctx, wrong_item)
+                        elif not can_equip(c, item):
+                            wrong_item = _("**{c}**, this item is too high level for you to reforge it.").format(
+                                c=self.escape(ctx.author.display_name)
+                            )
                             await smart_embed(ctx, wrong_item)
                         else:
                             break
@@ -2451,16 +3087,15 @@ class Adventure(BaseCog):
                 await smart_embed(
                     ctx,
                     _(
-                        "Reply with the full or partial name of item 2 to select for forging. Try to be specific. (Say `cancel` to exit)"
+                        "Reply with the full or partial name of item 2 to select for forging. "
+                        "Try to be specific. (Say `cancel` to exit)"
                     ),
                 )
                 try:
                     item = None
                     while not item:
                         reply = await ctx.bot.wait_for(
-                            "message",
-                            check=MessagePredicate.same_context(user=ctx.author),
-                            timeout=30,
+                            "message", check=MessagePredicate.same_context(user=ctx.author), timeout=30,
                         )
                         if reply.content.lower() in ["cancel", "exit"]:
                             return await smart_embed(ctx, _("Forging process has been cancelled."))
@@ -2472,16 +3107,20 @@ class Adventure(BaseCog):
                                 item = None
                         if item and consumed[0].owned <= 1 and str(consumed[0]) == str(item):
                             wrong_item = _(
-                                "**{c}**, You only own 1 copy of this item and "
-                                "you already selected it."
+                                "**{c}**, you only own 1 copy of this item and you've already selected it."
                             ).format(c=self.escape(ctx.author.display_name))
                             await smart_embed(ctx, wrong_item)
                             item = None
                             continue
                         if not item:
-                            wrong_item = _(
-                                "**{c}**, I could not find that item - check your spelling."
-                            ).format(c=self.escape(ctx.author.display_name))
+                            wrong_item = _("**{c}**, I could not find that item - check your spelling.").format(
+                                c=self.escape(ctx.author.display_name)
+                            )
+                            await smart_embed(ctx, wrong_item)
+                        elif not can_equip(c, item):
+                            wrong_item = _("**{c}**, this item is too high level for you to reforge it.").format(
+                                c=self.escape(ctx.author.display_name)
+                            )
                             await smart_embed(ctx, wrong_item)
                         else:
                             break
@@ -2513,12 +3152,8 @@ class Adventure(BaseCog):
                 lookup = list(i for n, i in c.backpack.items() if i.rarity == "forged")
                 if len(lookup) > 0:
                     forge_str = box(
-                        _(
-                            "{author}, you already have a device. "
-                            "Do you want to replace {replace}?"
-                        ).format(
-                            author=self.escape(ctx.author.display_name),
-                            replace=", ".join([str(x) for x in lookup]),
+                        _("{author}, you already have a device. Do you want to replace {replace}?").format(
+                            author=self.escape(ctx.author.display_name), replace=", ".join([str(x) for x in lookup]),
                         ),
                         lang="css",
                     )
@@ -2535,10 +3170,7 @@ class Adventure(BaseCog):
                     if pred.result:  # user reacted with Yes.
                         c.heroclass["cooldown"] = time.time() + cooldown_time
                         created_item = box(
-                            _(
-                                "{author}, your new {newitem} consumed {lk} "
-                                "and is now lurking in your backpack."
-                            ).format(
+                            _("{author}, your new {newitem} consumed {lk} and is now lurking in your backpack.").format(
                                 author=self.escape(ctx.author.display_name),
                                 newitem=newitem,
                                 lk=", ".join([str(x) for x in lookup]),
@@ -2554,9 +3186,9 @@ class Adventure(BaseCog):
                         c.heroclass["cooldown"] = time.time() + cooldown_time
                         await self.config.user(ctx.author).set(await c.to_json(self.config))
                         mad_forge = box(
-                            _(
-                                "{author}, {newitem} got mad at your rejection and blew itself up."
-                            ).format(author=self.escape(ctx.author.display_name), newitem=newitem),
+                            _("{author}, {newitem} got mad at your rejection and blew itself up.").format(
+                                author=self.escape(ctx.author.display_name), newitem=newitem
+                            ),
                             lang="css",
                         )
                         return await ctx.send(mad_forge)
@@ -2572,11 +3204,20 @@ class Adventure(BaseCog):
                     )
                     await ctx.send(forged_item)
 
-    async def _to_forge(self, ctx: Context, consumed, character):
+    async def _to_forge(self, ctx: commands.Context, consumed, character):
         item1 = consumed[0]
         item2 = consumed[1]
 
-        roll = random.randint(1, 20) + (character.total_int // 50) + (character.luck // 20)
+        roll = max(
+            (
+                random.randint(1, 20)
+                + int(
+                    (character.total_int + character.luck)
+                    / (character.total_stats - (character.total_int + character.luck))
+                )
+            ),
+            0,
+        )
         if roll == 1:
             modifier = 0.4
         elif 1 < roll <= 6:
@@ -2677,9 +3318,7 @@ class Adventure(BaseCog):
         reply = None
         name = _("Unnamed Artifact")
         try:
-            reply = await ctx.bot.wait_for(
-                "message", check=MessagePredicate.same_context(user=ctx.author), timeout=30
-            )
+            reply = await ctx.bot.wait_for("message", check=MessagePredicate.same_context(user=ctx.author), timeout=30)
         except asyncio.TimeoutError:
             name = _("Unnamed Artifact")
         if reply is None:
@@ -2706,63 +3345,28 @@ class Adventure(BaseCog):
 
     @commands.group()
     @commands.guild_only()
-    @checks.admin_or_permissions(manage_guild=True)
-    async def give(self, ctx: Context):
+    @commands.admin_or_permissions(manage_guild=True)
+    async def give(self, ctx: commands.Context):
         """[Admin] Commands to add things to players' inventories."""
 
-    @give.command(name="funds")
-    @check_global_setting_admin()
-    async def _give_funds(self, ctx: Context, amount: int = 1, *, to: discord.Member = None):
-        """[Admin] Adds currency to a specified member's balance."""
-        if to is None:
-            return await smart_embed(
-                ctx,
-                _("You need to specify a receiving member, **{}**.").format(
-                    self.escape(ctx.author.display_name)
-                ),
-            )
-        to_fund = discord.utils.find(lambda m: m.name == to.name, ctx.guild.members)
-        if not to_fund:
-            return await smart_embed(
-                ctx,
-                _(
-                    "I could not find that user, **{}**. Try using their full Discord name (name#0000)."
-                ).format(self.escape(ctx.author.display_name)),
-            )
-        amount = max(amount, 0)
-        try:
-            bal = await bank.deposit_credits(to, amount)
-        except BalanceTooHigh:
-            bal = await get_max_balance(ctx.guild)
-        currency = await bank.get_currency_name(ctx.guild)
-        if str(currency).startswith("<:"):
-            currency = "credits"
-        await ctx.send(
-            box(
-                _(
-                    "{author}, you funded {amount} {currency}. {to} now has {bal} {currency}."
-                ).format(
-                    author=self.escape(ctx.author.display_name),
-                    amount=humanize_number(amount),
-                    currency=currency,
-                    to=self.escape(to.display_name),
-                    bal=bal,
-                ),
-                lang="css",
-            )
-        )
-
     @give.command(name="item")
-    async def _give_item(
-        self, ctx: Context, user: discord.Member, item_name: str, *, stats: Stats
-    ):
-        """[Admin] Adds a custom item to a specified member.
+    @commands.is_owner()
+    async def _give_item(self, ctx: commands.Context, user: discord.User, item_name: str, *, stats: Stats):
+        """[Owner] Adds a custom item to a specified member.
 
         Item names containing spaces must be enclosed in double quotes. `[p]give item @locastan
         "fine dagger" 1 att 1 charisma rare twohanded` will give a two handed .fine_dagger with 1
         attack and 1 charisma to locastan. if a stat is not specified it will default to 0, order
         does not matter. available stats are attack(att), charisma(diplo) or charisma(cha),
         intelligence(int), dexterity(dex), and luck.
+
+        Item rarity is one of normal, rare, epic, legendary, set, forged, event.
+
+        Event items can have their level requirement and degrade number set via:
+        N degrade - (Set to -1 to never degrade on rebirths)
+        N level
+
+        `[p]give item @locastan "fine dagger" 1 att 1 charisma -1 degrade 100 level rare twohanded`
         """
         if item_name.isnumeric():
             return await smart_embed(ctx, _("Item names cannot be numbers."))
@@ -2773,7 +3377,7 @@ class Adventure(BaseCog):
         item = Item.from_json(new_item)
         async with self.get_lock(user):
             try:
-                c = await Character.from_json(self.config, user)
+                c = await Character.from_json(self.config, user, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 return
@@ -2781,80 +3385,82 @@ class Adventure(BaseCog):
             await self.config.user(user).set(await c.to_json(self.config))
         await ctx.send(
             box(
-                _(
-                    "An item named {item} has been created and placed in {author}'s backpack."
-                ).format(item=item, author=self.escape(user.display_name)),
+                _("An item named {item} has been created and placed in {author}'s backpack.").format(
+                    item=item, author=self.escape(user.display_name)
+                ),
                 lang="css",
             )
         )
 
     @give.command(name="loot")
+    @commands.is_owner()
     async def _give_loot(
-        self, ctx: Context, loot_type: str, user: discord.Member = None, number: int = 1
+        self, ctx: commands.Context, loot_type: str, users: commands.Greedy[discord.User] = None, number: int = 1
     ):
-        """[Admin] Give treasure chest(s) to a specified member."""
+        """[Owner] Give treasure chest(s) to all specified users."""
 
-        if user is None:
-            user = ctx.author
-        loot_types = ["normal", "rare", "epic", "legendary", "set"]
+        users = users or [ctx.author]
+        loot_types = ["normal", "rare", "epic", "legendary", "ascended", "set"]
         if loot_type not in loot_types:
             return await smart_embed(
                 ctx,
                 (
-                    "Valid loot types: `normal`, `rare`, `epic` or `legendary`: "
+                    "Valid loot types: `normal`, `rare`, `epic`, `legendary`, `ascended` or `set`: "
                     "ex. `{}give loot normal @locastan` "
                 ).format(ctx.prefix),
             )
-        if loot_type in ["legendary", "set"] and not await ctx.bot.is_owner(ctx.author):
+        if loot_type in ["legendary", "set", "ascended"] and not await ctx.bot.is_owner(ctx.author):
             return await smart_embed(ctx, _("You are not worthy to award legendary loot."))
-        async with self.get_lock(user):
-            try:
-                c = await Character.from_json(self.config, user)
-            except Exception as exc:
-                log.exception("Error with the new character sheet", exc_info=exc)
-                return
-            if loot_type == "rare":
-                c.treasure[1] += number
-            elif loot_type == "epic":
-                c.treasure[2] += number
-            elif loot_type == "legendary":
-                c.treasure[3] += number
-            elif loot_type == "set":
-                c.treasure[4] += number
-            else:
-                c.treasure[0] += number
-            await self.config.user(user).set(await c.to_json(self.config))
-            await ctx.send(
-                box(
-                    _(
-                        "{author} now owns {normal} normal, "
-                        "{rare} rare, {epic} epic, "
-                        "{leg} legendary and {set} set treasure chests."
-                    ).format(
-                        author=self.escape(user.display_name),
-                        normal=str(c.treasure[0]),
-                        rare=str(c.treasure[1]),
-                        epic=str(c.treasure[2]),
-                        leg=str(c.treasure[3]),
-                        set=str(c.treasure[4]),
-                    ),
-                    lang="css",
+        for user in users:
+            async with self.get_lock(user):
+                try:
+                    c = await Character.from_json(self.config, user, self._daily_bonus)
+                except Exception as exc:
+                    log.exception("Error with the new character sheet", exc_info=exc)
+                    return
+                if loot_type == "rare":
+                    c.treasure[1] += number
+                elif loot_type == "epic":
+                    c.treasure[2] += number
+                elif loot_type == "legendary":
+                    c.treasure[3] += number
+                elif loot_type == "ascended":
+                    c.treasure[4] += number
+                elif loot_type == "set":
+                    c.treasure[5] += number
+                else:
+                    c.treasure[0] += number
+                await self.config.user(user).set(await c.to_json(self.config))
+                await ctx.send(
+                    box(
+                        _(
+                            "{author} now owns {normal} normal, "
+                            "{rare} rare, {epic} epic, "
+                            "{leg} legendary, {asc} ascended and {set} set treasure chests."
+                        ).format(
+                            author=self.escape(user.display_name),
+                            normal=str(c.treasure[0]),
+                            rare=str(c.treasure[1]),
+                            epic=str(c.treasure[2]),
+                            leg=str(c.treasure[3]),
+                            asc=str(c.treasure[4]),
+                            set=str(c.treasure[5]),
+                        ),
+                        lang="css",
+                    )
                 )
-            )
 
     @commands.command(cooldown_after_parsing=True)
     @commands.bot_has_permissions(add_reactions=True)
     @commands.cooldown(rate=1, per=7200, type=commands.BucketType.user)
-    async def heroclass(self, ctx: Context, clz: str = None, action: str = None):
+    async def heroclass(self, ctx: commands.Context, clz: str = None, action: str = None):
         """Allows you to select a class if you are level 10 or above.
 
         For information on class use: `[p]heroclass classname info`.
         """
         if self.in_adventure(ctx):
             ctx.command.reset_cooldown(ctx)
-            return await smart_embed(
-                ctx, _("The monster ahead growls menacingly, and will not let you leave.")
-            )
+            return await smart_embed(ctx, _("The monster ahead growls menacingly, and will not let you leave."))
         if not await self.allow_in_dm(ctx):
             ctx.command.reset_cooldown(ctx)
             return await smart_embed(ctx, _("This command is not available in DM's on this bot."))
@@ -2865,7 +3471,8 @@ class Adventure(BaseCog):
                 "ability": False,
                 "desc": _(
                     "Wizards have the option to focus and add large bonuses to their magic, "
-                    "but their focus can sometimes go astray...\nUse the focus command when attacking in an adventure."
+                    "but their focus can sometimes go astray...\n"
+                    "Use the focus command when attacking in an adventure."
                 ),
                 "cooldown": time.time(),
             },
@@ -2916,6 +3523,16 @@ class Adventure(BaseCog):
                 ),
                 "cooldown": time.time(),
             },
+            "Psychic": {
+                "name": _("Psychic"),
+                "ability": False,
+                "desc": _(
+                    "Psychics can show the enemy's weaknesses to their group "
+                    "allowing them to target the monster's weak-points.\n"
+                    "Use the insight command in an adventure."
+                ),
+                "cooldown": time.time(),
+            },
         }
 
         if clz is None:
@@ -2924,7 +3541,8 @@ class Adventure(BaseCog):
                 ctx,
                 _(
                     "So you feel like taking on a class, **{author}**?\n"
-                    "Available classes are: Tinkerer, Berserker, Wizard, Cleric, Ranger and Bard.\n"
+                    "Available classes are: Tinkerer, Berserker, "
+                    "Wizard, Cleric, Ranger, Psychic and Bard.\n"
                     "Use `{prefix}heroclass name-of-class` to choose one."
                 ).format(author=self.escape(ctx.author.display_name), prefix=ctx.prefix),
             )
@@ -2936,29 +3554,29 @@ class Adventure(BaseCog):
                 return await smart_embed(ctx, f"{classes[clz]['desc']}")
             elif clz not in classes:
                 ctx.command.reset_cooldown(ctx)
-                return await smart_embed(
-                    ctx, _("{} may be a class somewhere, but not on my watch.").format(clz)
-                )
+                return await smart_embed(ctx, _("{} may be a class somewhere, but not on my watch.").format(clz))
             elif clz in classes and action is None:
                 async with self.get_lock(ctx.author):
                     bal = await bank.get_balance(ctx.author)
-                    currency_name = await bank.get_currency_name(ctx.guild)
+                    currency_name = await bank.get_currency_name(ctx.guild,)
                     if str(currency_name).startswith("<"):
                         currency_name = "credits"
                     spend = round(bal * 0.2)
                     try:
-                        c = await Character.from_json(self.config, ctx.author)
+                        c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
                     except Exception as exc:
                         log.exception("Error with the new character sheet", exc_info=exc)
+                        ctx.command.reset_cooldown(ctx)
                         return
                     if c.heroclass["name"] == clz:
+                        ctx.command.reset_cooldown(ctx)
                         return await smart_embed(ctx, _("You already are a {}.").format(clz))
+                    if clz == "Psychic" and c.rebirths < 25:
+                        ctx.command.reset_cooldown(ctx)
+                        return await smart_embed(ctx, _("You are too inexperienced to become a {}.").format(clz))
                     class_msg = await ctx.send(
                         box(
-                            _(
-                                "This will cost {spend} {currency_name}. "
-                                "Do you want to continue, {author}?"
-                            ).format(
+                            _("This will cost {spend} {currency_name}. Do you want to continue, {author}?").format(
                                 spend=humanize_number(spend),
                                 currency_name=currency_name,
                                 author=self.escape(ctx.author.display_name),
@@ -2985,8 +3603,7 @@ class Adventure(BaseCog):
                         await class_msg.edit(
                             content=box(
                                 _("{author} decided to continue being a {h_class}.").format(
-                                    author=self.escape(ctx.author.display_name),
-                                    h_class=c.heroclass["name"],
+                                    author=self.escape(ctx.author.display_name), h_class=c.heroclass["name"],
                                 ),
                                 lang="css",
                             )
@@ -3000,7 +3617,7 @@ class Adventure(BaseCog):
                     if not await bank.can_spend(ctx.author, spend):
                         return await class_msg.edit(content=broke)
                     try:
-                        c = await Character.from_json(self.config, ctx.author)
+                        c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
                     except Exception as exc:
                         log.exception("Error with the new character sheet", exc_info=exc)
                         return
@@ -3025,8 +3642,7 @@ class Adventure(BaseCog):
                                 await class_msg.edit(
                                     content=box(
                                         _(
-                                            "{}, you will lose your pet "
-                                            "if you change your class.\nShall I proceed?"
+                                            "{}, you will lose your pet if you change your class.\nShall I proceed?"
                                         ).format(self.escape(ctx.author.display_name)),
                                         lang="css",
                                     )
@@ -3050,9 +3666,7 @@ class Adventure(BaseCog):
                                 for item in tinker_wep:
                                     del c.backpack[item.name]
                                 if c.heroclass["name"] == "Tinkerer":
-                                    await self.config.user(ctx.author).set(
-                                        await c.to_json(self.config)
-                                    )
+                                    await self.config.user(ctx.author).set(await c.to_json(self.config))
                                     if tinker_wep:
                                         await class_msg.edit(
                                             content=box(
@@ -3068,9 +3682,7 @@ class Adventure(BaseCog):
                                     c.heroclass["pet"] = {}
                                     c.heroclass = classes[clz]
 
-                                    await self.config.user(ctx.author).set(
-                                        await c.to_json(self.config)
-                                    )
+                                    await self.config.user(ctx.author).set(await c.to_json(self.config))
                                     await self._clear_react(class_msg)
                                     await class_msg.edit(
                                         content=box(
@@ -3080,9 +3692,7 @@ class Adventure(BaseCog):
                                             lang="css",
                                         )
                                     )
-                                await class_msg.edit(
-                                    content=class_msg.content + box(now_class_msg, lang="css")
-                                )
+                                await class_msg.edit(content=class_msg.content + box(now_class_msg, lang="css"))
                             else:
                                 ctx.command.reset_cooldown(ctx)
                                 return
@@ -3091,27 +3701,29 @@ class Adventure(BaseCog):
                         c.heroclass = classes[clz]
                         if c.heroclass["name"] in ["Wizard", "Cleric"]:
                             c.heroclass["cooldown"] = (
-                                max(300, (1200 - ((c.luck + c.total_int) * 2))) + time.time()
+                                max(300, (1200 - max((c.luck + c.total_int) * 2, 0))) + time.time()
                             )
                         elif c.heroclass["name"] == "Ranger":
                             c.heroclass["cooldown"] = (
-                                max(1800, (7200 - (c.luck * 2 + c.total_int * 2))) + time.time()
+                                max(1800, (7200 - max(c.luck * 2 + c.total_int * 2, 0))) + time.time()
                             )
                             c.heroclass["catch_cooldown"] = (
-                                max(600, (3600 - (c.luck * 2 + c.total_int * 2))) + time.time()
+                                max(600, (3600 - max(c.luck * 2 + c.total_int * 2, 0))) + time.time()
                             )
                         elif c.heroclass["name"] == "Berserker":
                             c.heroclass["cooldown"] = (
-                                max(300, (1200 - ((c.luck + c.total_att) * 2))) + time.time()
+                                max(300, (1200 - max((c.luck + c.total_att) * 2, 0))) + time.time()
                             )
                         elif c.heroclass["name"] == "Bard":
                             c.heroclass["cooldown"] = (
-                                max(300, (1200 - ((c.luck + c.total_cha) * 2))) + time.time()
+                                max(300, (1200 - max((c.luck + c.total_cha) * 2, 0))) + time.time()
                             )
                         elif c.heroclass["name"] == "Tinkerer":
                             c.heroclass["cooldown"] = (
-                                max(900, (3600 - (c.luck + c.total_int) * 2)) + time.time()
+                                max(900, (3600 - max((c.luck + c.total_int) * 2, 0))) + time.time()
                             )
+                        elif c.heroclass["name"] == "Psychic":
+                            c.heroclass["cooldown"] = max(300, (900 - max((c.luck - c.total_cha) * 2, 0))) + time.time()
                         await self.config.user(ctx.author).set(await c.to_json(self.config))
                         await self._clear_react(class_msg)
                         await class_msg.edit(content=box(now_class_msg, lang="css"))
@@ -3123,9 +3735,9 @@ class Adventure(BaseCog):
                         ctx.command.reset_cooldown(ctx)
                         await smart_embed(
                             ctx,
-                            _(
-                                "**{}**, you need to be at least level 10 to choose a class."
-                            ).format(self.escape(ctx.author.display_name)),
+                            _("**{}**, you need to be at least level 10 to choose a class.").format(
+                                self.escape(ctx.author.display_name)
+                            ),
                         )
 
     @staticmethod
@@ -3142,26 +3754,23 @@ class Adventure(BaseCog):
     @commands.command()
     @commands.bot_has_permissions(add_reactions=True)
     @commands.cooldown(rate=1, per=4, type=commands.BucketType.user)
-    async def loot(self, ctx: Context, box_type: str = None, number: int = 1):
+    async def loot(self, ctx: commands.Context, box_type: str = None, number: int = 1):
         """This opens one of your precious treasure chests.
 
-        Use the box rarity type with the command: normal, rare, epic, legendary or set.
+        Use the box rarity type with the command: normal, rare, epic, legendary, ascended or set.
         """
-        if number > 100 or number < 1:
+        if (not self.is_dev(ctx.author) and number > 100) or number < 1:
             return await smart_embed(ctx, _("Nice try :smirk:."))
         if self.in_adventure(ctx):
             return await smart_embed(
-                ctx,
-                _(
-                    "You tried to open a loot chest but then realised you left them all back at the inn."
-                ),
+                ctx, _("You tried to open a loot chest but then realised you left them all back at the inn."),
             )
         if not await self.allow_in_dm(ctx):
             return await smart_embed(ctx, _("This command is not available in DM's on this bot."))
         msgs = []
         async with self.get_lock(ctx.author):
             try:
-                c = await Character.from_json(self.config, ctx.author)
+                c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 return
@@ -3170,18 +3779,26 @@ class Adventure(BaseCog):
                     box(
                         _(
                             "{author} owns {normal} normal, "
-                            "{rare} rare, {epic} epic, {leg} legendary and {set} set chests."
+                            "{rare} rare, {epic} epic, {leg} legendary, {asc} ascended and {set} set chests."
                         ).format(
                             author=self.escape(ctx.author.display_name),
                             normal=str(c.treasure[0]),
                             rare=str(c.treasure[1]),
                             epic=str(c.treasure[2]),
                             leg=str(c.treasure[3]),
-                            set=str(c.treasure[4]),
+                            asc=str(c.treasure[4]),
+                            set=str(c.treasure[5]),
                         ),
                         lang="css",
                     )
                 )
+            if c.is_backpack_full(is_dev=self.is_dev(ctx.author)):
+                await ctx.send(
+                    _("**{author}**, your backpack is currently full.").format(
+                        author=self.escape(ctx.author.display_name)
+                    )
+                )
+                return
             if box_type == "normal":
                 redux = 0
             elif box_type == "rare":
@@ -3190,88 +3807,114 @@ class Adventure(BaseCog):
                 redux = 2
             elif box_type == "legendary":
                 redux = 3
-            elif box_type == "set":
+            elif box_type == "ascended":
                 redux = 4
+            elif box_type == "set":
+                redux = 5
             else:
                 return await smart_embed(
-                    ctx,
-                    _("There is talk of a {} treasure chest but nobody ever saw one.").format(
-                        box_type
-                    ),
+                    ctx, _("There is talk of a {} treasure chest but nobody ever saw one.").format(box_type),
                 )
             treasure = c.treasure[redux]
             if treasure < 1 or treasure < number:
                 await smart_embed(
                     ctx,
-                    _(
-                        "**{author}**, you do not have enough {box} treasure chests to open."
-                    ).format(author=self.escape(ctx.author.display_name), box=box_type),
+                    _("**{author}**, you do not have enough {box} treasure chests to open.").format(
+                        author=self.escape(ctx.author.display_name), box=box_type
+                    ),
                 )
             else:
                 if number > 1:
-                    # atomically save reduced loot count then lock again when saving inside
-                    # open chests
-                    c.treasure[redux] -= number
-                    await self.config.user(ctx.author).set(await c.to_json(self.config))
-                    items = await self._open_chests(ctx, ctx.author, box_type, number, character=c)
-                    msg = _(
-                        "{}, you've opened the following items:\n"
-                        "( ATT | CHA | INT | DEX | LUCK ) | LEVEL REQ | LOOTED | SET (SET PIECES)"
-                    ).format(self.escape(ctx.author.display_name))
-                    rjust = max([len(str(i)) for i in items.values()])
-                    for item in items.values():
-                        await asyncio.sleep(0)
-                        settext = ""
-                        att_space = " " if len(str(item.att)) == 1 else ""
-                        cha_space = " " if len(str(item.cha)) == 1 else ""
-                        int_space = " " if len(str(item.int)) == 1 else ""
-                        dex_space = " " if len(str(item.dex)) == 1 else ""
-                        luck_space = " " if len(str(item.luck)) == 1 else ""
-                        owned = f" | {item.owned}"
-                        if item.set:
-                            settext += f" | Set `{item.set}` ({item.parts}pcs)"
-                        msg += (
-                            f"\n{str(item):<{rjust}} - "
-                            f"({att_space}{item.att} |"
-                            f"{cha_space}{item.cha} |"
-                            f"{int_space}{item.int} |"
-                            f"{dex_space}{item.dex} |"
-                            f"{luck_space}{item.luck} )"
-                            f" | Lv {equip_level(c, item):<3}"
-                            f"{owned}{settext}"
+                    async with ctx.typing():
+                        # atomically save reduced loot count then lock again when saving inside
+                        # open chests
+                        c.treasure[redux] -= number
+                        await self.config.user(ctx.author).set(await c.to_json(self.config))
+                        items = await self._open_chests(ctx, box_type, number, character=c)
+                        msg = _("{}, you've opened the following items:\n\n").format(
+                            self.escape(ctx.author.display_name)
                         )
-                    msgs = []
-                    for page in pagify(msg, page_length=1900):
-                        msgs.append(box(page, lang="css"))
+                        msg_len = len(msg)
+                        table = BeautifulTable(default_alignment=ALIGN_LEFT, maxwidth=500)
+                        table.set_style(BeautifulTable.STYLE_RST)
+                        msgs = []
+                        total = len(items.values())
+                        table.columns.header = [
+                            "Name",
+                            "Slot",
+                            "ATT",
+                            "CHA",
+                            "INT",
+                            "DEX",
+                            "LUC",
+                            "LVL",
+                            "QTY",
+                            "DEG",
+                            "SET",
+                        ]
+                        async for index, item in AsyncIter(items.values(), steps=100).enumerate(start=1):
+                            if len(str(table)) > 1500:
+                                table.rows.sort("LVL", reverse=True)
+                                msgs.append(box(msg + str(table) + f"\nPage {len(msgs) + 1}", lang="css"))
+                                table = BeautifulTable(default_alignment=ALIGN_LEFT, maxwidth=500)
+                                table.set_style(BeautifulTable.STYLE_RST)
+                                table.columns.header = [
+                                    "Name",
+                                    "Slot",
+                                    "ATT",
+                                    "CHA",
+                                    "INT",
+                                    "DEX",
+                                    "LUC",
+                                    "LVL",
+                                    "QTY",
+                                    "DEG",
+                                    "SET",
+                                ]
+                            table.rows.append(
+                                (
+                                    str(item),
+                                    item.slot[0] if len(item.slot) == 1 else "two handed",
+                                    item.att,
+                                    item.cha,
+                                    item.int,
+                                    item.dex,
+                                    item.luck,
+                                    f"[{r}]" if (r := equip_level(c, item)) is not None and r > c.lvl else f"{r}",
+                                    item.owned,
+                                    f"[{item.degrade}]"
+                                    if item.rarity in ["legendary", "event", "ascended"] and item.degrade >= 0
+                                    else "N/A",
+                                    item.set or "N/A",
+                                )
+                            )
+                            if index == total:
+                                table.rows.sort("LVL", reverse=True)
+                                msgs.append(box(msg + str(table) + f"\nPage {len(msgs) + 1}", lang="css"))
                 else:
-                    msgs = []
                     # atomically save reduced loot count then lock again when saving inside
                     # open chests
                     c.treasure[redux] -= 1
                     await self.config.user(ctx.author).set(await c.to_json(self.config))
-
-                    await self._open_chest(
-                        ctx, ctx.author, box_type, character=c
-                    )  # returns item and msg
+                    await self._open_chest(ctx, ctx.author, box_type, character=c)  # returns item and msg
         if msgs:
             await menu(ctx, msgs, DEFAULT_CONTROLS)
 
     @commands.command(name="negaverse", aliases=["nv"], cooldown_after_parsing=True)
     @commands.cooldown(rate=1, per=3600, type=commands.BucketType.user)
     @commands.guild_only()
-    async def _negaverse(self, ctx: Context, offering: int = None):
+    async def _negaverse(
+        self, ctx: commands.Context, offering: int = None, roll: Optional[int] = -1, nega: discord.User = None
+    ):
         """This will send you to fight a nega-member!"""
         if self.in_adventure(ctx):
             ctx.command.reset_cooldown(ctx)
             return await smart_embed(
-                ctx,
-                _(
-                    "You tried to teleport to another dimension but the monster ahead did not give you a chance."
-                ),
+                ctx, _("You tried to teleport to another dimension but the monster ahead did not give you a chance."),
             )
 
         bal = await bank.get_balance(ctx.author)
-        currency_name = await bank.get_currency_name(ctx.guild)
+        currency_name = await bank.get_currency_name(ctx.guild,)
         if offering is None:
             ctx.command.reset_cooldown(ctx)
             return await smart_embed(
@@ -3285,7 +3928,20 @@ class Adventure(BaseCog):
             ctx.command.reset_cooldown(ctx)
             return await smart_embed(ctx, _("The gods refuse your pitiful offering."))
         if offering > bal:
-            offering = bal
+            offering = int(bal)
+        admin_roll = -1
+        nega_set = False
+        if (roll >= 0 or nega) and await self.bot.is_owner(ctx.author):
+            if not self.is_dev(ctx.author):
+                if not await no_dev_prompt(ctx):
+                    ctx.command.reset_cooldown(ctx)
+                    return
+            nega_set = True
+            admin_roll = roll
+        offering_value = 0
+        winning_state = False
+        loss_state = False
+        xp_won_final = 0
         lock = self.get_lock(ctx.author)
         await lock.acquire()
         try:
@@ -3313,16 +3969,16 @@ class Adventure(BaseCog):
                 with contextlib.suppress(discord.HTTPException):
                     ctx.command.reset_cooldown(ctx)
                     await nv_msg.edit(
-                        content=_(
-                            "**{}** decides against visiting the negaverse... for now."
-                        ).format(self.escape(ctx.author.display_name))
+                        content=_("**{}** decides against visiting the negaverse... for now.").format(
+                            self.escape(ctx.author.display_name)
+                        )
                     )
                     lock.release()
                     return await self._clear_react(nv_msg)
 
             percentage_offered = (offering / bal) * 100
             min_roll = int(percentage_offered / 10)
-            entry_roll = random.randint(max(1, min_roll), 20)
+            entry_roll = max(random.randint(max(1, min_roll), 20), 0) if admin_roll == -1 else admin_roll
             if entry_roll == 1:
                 tax_mod = random.randint(4, 8)
                 tax = round(bal / tax_mod)
@@ -3330,6 +3986,8 @@ class Adventure(BaseCog):
                     loss = tax
                 else:
                     loss = offering
+                offering_value += loss
+                loss_state = True
                 await bank.withdraw_credits(ctx.author, loss)
                 entry_msg = _(
                     "A swirling void slowly grows and you watch in horror as it rushes to "
@@ -3346,10 +4004,12 @@ class Adventure(BaseCog):
                 await nv_msg.edit(content=entry_msg)
                 await self._clear_react(nv_msg)
                 await bank.withdraw_credits(ctx.author, offering)
-
-            negachar = _("Nega-{c}").format(
-                c=self.escape(random.choice(ctx.message.guild.members).display_name)
-            )
+            if nega_set:
+                nega_member = nega
+                negachar = _("The Almighty Nega-{c}").format(c=self.escape(nega_member.display_name))
+            else:
+                nega_member = random.choice(ctx.message.guild.members)
+                negachar = _("Nega-{c}").format(c=self.escape(nega_member.display_name))
 
             nega_msg = await ctx.send(
                 _("**{author}** enters the negaverse and meets **{negachar}**.").format(
@@ -3357,39 +4017,81 @@ class Adventure(BaseCog):
                 )
             )
 
-            roll = random.randint(max(1, min_roll * 2), 50)
-            versus = random.randint(10, 60)
-            xp_mod = random.randint(1, 10)
-            weekend = datetime.today().weekday() in [5, 6]
-            wedfriday = datetime.today().weekday() in [2, 4]
-            daymult = 2 if weekend else 1.5 if wedfriday else 1
-            xp_won = int((offering / xp_mod))
             try:
-                c = await Character.from_json(self.config, ctx.message.author)
+                character = await Character.from_json(self.config, ctx.author, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 lock.release()
+                ctx.command.reset_cooldown(ctx)
                 return
-            xp_to_max = int((c.maxlevel + 1) ** 3.5)
+            roll = random.randint(max(1, min_roll * 2), 50) if admin_roll == -1 else admin_roll
+            if self.is_dev(nega_member):
+                roll = -2
+            versus = random.randint(10, 60)
+            xp_mod = random.randint(1, 10)
+            daymult = self._daily_bonus.get(str(datetime.today().isoweekday()), 0)
+            xp_won = int((offering / xp_mod))
+            xp_to_max = int((character.maxlevel + 1) ** 3.5)
             ten_percent = xp_to_max * 0.1
             xp_won = ten_percent if xp_won > ten_percent else xp_won
-            xp_won = int(xp_won * (min(max(random.randint(0, c.rebirths), 1), 50) / 100 + 1))
-            xp_won = int(xp_won * (c.gear_set_bonus.get("xpmult", 1) + daymult - 1))
-            if roll < 10:
+            xp_won = int(xp_won * (min(max(random.randint(0, character.rebirths), 1), 50) / 100 + 1))
+            xp_won = int(xp_won * (character.gear_set_bonus.get("xpmult", 1) + daymult))
+            if roll == -2:
+                looted = ""
+                curr_balance = character.bal
+                await bank.set_balance(ctx.author, 0)
+                offering_value += curr_balance
+                loss_string = _("all of their")
+                loss_state = True
+                items = await character.looted(how_many=max(int(10 - roll) // 2, 1))
+                if items:
+                    item_string = "\n".join([f"{v} x{i}" for v, i in items])
+                    looted = box(f"{item_string}", lang="css")
+                    await self.config.user(ctx.author).set(await character.to_json(self.config))
+                loss_msg = _(
+                    ", losing {loss} {currency_name} as **{negachar}** rifled through their belongings."
+                ).format(loss=loss_string, currency_name=currency_name, negachar=negachar)
+                if looted:
+                    loss_msg += _(" **{negachar}** also stole the following items:\n\n{items}").format(
+                        items=looted, negachar=negachar
+                    )
+                await nega_msg.edit(
+                    content=_("{content}\n**{author}** fumbled and died to **{negachar}'s** savagery{loss_msg}").format(
+                        content=nega_msg.content,
+                        author=self.escape(ctx.author.display_name),
+                        negachar=negachar,
+                        loss_msg=loss_msg,
+                    )
+                )
+                ctx.command.reset_cooldown(ctx)
+            elif roll < 10:
                 loss = round(bal // 3)
+                looted = ""
+                curr_balance = character.bal
                 try:
                     await bank.withdraw_credits(ctx.author, loss)
-                    loss = humanize_number(loss)
+                    offering_value += loss
+                    loss_string = humanize_number(loss)
                 except ValueError:
                     await bank.set_balance(ctx.author, 0)
-                    loss = _("all of their")
+                    offering_value += curr_balance
+                    loss_string = _("all of their")
+                loss_state = True
+                if character.bal < loss:
+                    items = await character.looted(how_many=max(int(10 - roll) // 2, 1))
+                    if items:
+                        item_string = "\n".join([f"{v} {i}" for v, i in items])
+                        looted = box(f"{item_string}", lang="css")
+                        await self.config.user(ctx.author).set(await character.to_json(self.config))
                 loss_msg = _(
-                    ", losing {loss} {currency_name} as **{negachar}** rifled through their belongings"
-                ).format(loss=loss, currency_name=currency_name, negachar=negachar)
+                    ", losing {loss} {currency_name} as **{negachar}** rifled through their belongings."
+                ).format(loss=loss_string, currency_name=currency_name, negachar=negachar)
+                if looted:
+                    loss_msg += _(" **{negachar}** also stole the following items:\n\n{items}").format(
+                        items=looted, negachar=negachar
+                    )
                 await nega_msg.edit(
-                    content=_(
-                        "{content}\n**{author}** fumbled and died to **{negachar}'s** savagery{loss_msg}."
-                    ).format(
+                    content=_("{content}\n**{author}** fumbled and died to **{negachar}'s** savagery{loss_msg}").format(
                         content=nega_msg.content,
                         author=self.escape(ctx.author.display_name),
                         negachar=negachar,
@@ -3400,7 +4102,8 @@ class Adventure(BaseCog):
             elif roll == 50 and versus < 50:
                 await nega_msg.edit(
                     content=_(
-                        "{content}\n**{author}** decapitated **{negachar}**. You gain {xp_gain} xp and take "
+                        "{content}\n**{author}** decapitated **{negachar}**. "
+                        "You gain {xp_gain} xp and take "
                         "{offering} {currency_name} back from the shadowy corpse."
                     ).format(
                         content=nega_msg.content,
@@ -3413,7 +4116,12 @@ class Adventure(BaseCog):
                 )
                 with contextlib.suppress(Exception):
                     lock.release()
-                await self._add_rewards(ctx, ctx.message.author, xp_won, offering, False)
+                msg = await self._add_rewards(ctx, ctx.author, xp_won, offering, False)
+                xp_won_final += xp_won
+                offering_value += offering
+                winning_state = True
+                if msg:
+                    await smart_embed(ctx, msg, success=True)
             elif roll > versus:
                 await nega_msg.edit(
                     content=_(
@@ -3432,13 +4140,17 @@ class Adventure(BaseCog):
                 )
                 with contextlib.suppress(Exception):
                     lock.release()
-                await self._add_rewards(ctx, ctx.message.author, xp_won, 0, False)
+                msg = await self._add_rewards(ctx, ctx.author, xp_won, 0, False)
+                xp_won_final += xp_won
+                offering_value += offering
+                winning_state = True
+                if msg:
+                    await smart_embed(ctx, msg, success=True)
             elif roll == versus:
                 ctx.command.reset_cooldown(ctx)
                 await nega_msg.edit(
                     content=_(
-                        "{content}\n**{author}** "
-                        "{dice}({roll}) almost killed **{negachar}** {dice}({versus})."
+                        "{content}\n**{author}** {dice}({roll}) almost killed **{negachar}** {dice}({versus})."
                     ).format(
                         dice=self.emojis.dice,
                         content=nega_msg.content,
@@ -3450,21 +4162,33 @@ class Adventure(BaseCog):
                 )
             else:
                 loss = round(bal / (random.randint(10, 25)))
+                curr_balance = character.bal
+                looted = ""
                 try:
                     await bank.withdraw_credits(ctx.author, loss)
+                    offering_value += loss
+                    loss_string = humanize_number(loss)
                 except ValueError:
                     await bank.set_balance(ctx.author, 0)
-                    loss = _("all of their")
-                loss_msg = _(
-                    ", losing {loss} {currency_name} as **{negachar}** looted their backpack"
-                ).format(
-                    loss=humanize_number(loss) if not isinstance(loss, str) else loss,
-                    currency_name=currency_name,
-                    negachar=negachar,
+                    loss_string = _("all of their")
+                    offering_value += curr_balance
+                loss_state = True
+                if character.bal < loss:
+                    items = await character.looted(how_many=max(int(10 - roll) // 2, 1))
+                    if items:
+                        item_string = "\n".join([f"{i}  - {v}" for v, i in items])
+                        looted = box(f"{item_string}", lang="css")
+                        await self.config.user(ctx.author).set(await character.to_json(self.config))
+                loss_msg = _(", losing {loss} {currency_name} as **{negachar}** looted their backpack.").format(
+                    loss=loss_string, currency_name=currency_name, negachar=negachar,
                 )
+                if looted:
+                    loss_msg += _(" **{negachar}** also stole the following items\n\n{items}").format(
+                        items=looted, negachar=negachar
+                    )
                 await nega_msg.edit(
                     content=_(
-                        "**{author}** {dice}({roll}) was killed by **{negachar}** {dice}({versus}){loss_msg}."
+                        "**{author}** {dice}({roll}) was killed by **{negachar}** {dice}({versus}){loss_msg}"
                     ).format(
                         dice=self.emojis.dice,
                         author=self.escape(ctx.author.display_name),
@@ -3479,110 +4203,120 @@ class Adventure(BaseCog):
             lock = self.get_lock(ctx.author)
             with contextlib.suppress(Exception):
                 lock.release()
+            try:
+                character = await Character.from_json(self.config, ctx.author, self._daily_bonus)
+            except Exception as exc:
+                log.exception("Error with the new character sheet", exc_info=exc)
+            else:
+                changed = False
+                if character.last_currency_check + 600 < time.time() or character.bal > character.last_known_currency:
+                    character.last_known_currency = await bank.get_balance(ctx.author)
+                    character.last_currency_check = time.time()
+                    changed = True
+                if offering_value > 0:
+                    current_gold__losses_value = character.nega.get("gold__losses", 0)
+                    character.nega.update({"gold__losses": int(current_gold__losses_value + offering_value)})
+                    changed = True
+                if xp_won_final > 0:
+                    current_xp__earnings_value = character.nega.get("xp__earnings", 0)
+                    character.nega.update({"xp__earnings": current_xp__earnings_value + xp_won_final})
+                    changed = True
+                if winning_state is not False:
+                    current_wins_value = character.nega.get("wins", 0)
+                    character.nega.update({"wins": current_wins_value + 1})
+                    changed = True
+                if loss_state is not False:
+                    current_loses_value = character.nega.get("loses", 0)
+                    character.nega.update({"loses": current_loses_value + 1})
+                    changed = True
+
+                if changed:
+                    await self.config.user(ctx.author).set(await character.to_json(self.config))
 
     @commands.group(autohelp=False)
     @commands.cooldown(rate=1, per=5, type=commands.BucketType.user)
-    async def pet(self, ctx: Context):
+    async def pet(self, ctx: commands.Context):
         """[Ranger Class Only]
 
         This allows a Ranger to tame or set free a pet or send it foraging.
         """
         if ctx.invoked_subcommand is None:
             if self.in_adventure(ctx):
-                return await smart_embed(
-                    ctx, _("You're too distracted with the monster you are facing.")
-                )
+                return await smart_embed(ctx, _("You're too distracted with the monster you are facing."))
 
             if not await self.allow_in_dm(ctx):
-                return await smart_embed(
-                    ctx, _("This command is not available in DM's on this bot.")
-                )
+                return await smart_embed(ctx, _("This command is not available in DM's on this bot."))
             async with self.get_lock(ctx.author):
                 try:
-                    c = await Character.from_json(self.config, ctx.author)
+                    c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
                 except Exception as exc:
                     log.exception("Error with the new character sheet", exc_info=exc)
                     return
                 if c.heroclass["name"] != "Ranger":
-                    return await ctx.send(
-                        box(
-                            _("{}, you need to be a Ranger to do this.").format(
-                                self.escape(ctx.author.display_name)
-                            ),
-                            lang="css",
-                        )
+                    return await smart_embed(
+                        ctx,
+                        _("**{}**, you need to be a Ranger to do this.").format(self.escape(ctx.author.display_name)),
                     )
                 if c.heroclass["pet"]:
                     ctx.command.reset_cooldown(ctx)
                     return await ctx.send(
                         box(
-                            _(
-                                "{author}, you already have a pet. "
-                                "Try foraging ({prefix}pet forage)."
-                            ).format(
+                            _("{author}, you already have a pet. Try foraging ({prefix}pet forage).").format(
                                 author=self.escape(ctx.author.display_name), prefix=ctx.prefix
                             ),
                             lang="css",
                         )
                     )
                 else:
-                    cooldown_time = max(600, (3600 - (c.luck * 2 + c.total_int * 2)))
+                    cooldown_time = max(600, (3600 - max((c.luck + c.total_int) * 2, 0)))
                     if "catch_cooldown" not in c.heroclass:
                         c.heroclass["catch_cooldown"] = cooldown_time + 1
-                    if c.heroclass["catch_cooldown"] + cooldown_time > time.time():
-                        cooldown_time = (
-                            (c.heroclass["catch_cooldown"]) + cooldown_time - time.time()
-                        )
+                    if c.heroclass["catch_cooldown"] > time.time():
+                        cooldown_time = c.heroclass["catch_cooldown"] - time.time()
                         return await smart_embed(
                             ctx,
                             _(
-                                "You caught a pet recently, or you are a brand new Ranger. You will be able to go hunting in {}."
+                                "You caught a pet recently, or you are a brand new Ranger. "
+                                "You will be able to go hunting in {}."
                             ).format(
                                 humanize_timedelta(seconds=int(cooldown_time))
                                 if int(cooldown_time) >= 1
                                 else _("1 second")
                             ),
                         )
-                    extra_dipl = 0
                     theme = await self.config.theme()
                     extra_pets = await self.config.themes.all()
                     extra_pets = extra_pets.get(theme, {}).get("pets", {})
                     pet_list = {**self.PETS, **extra_pets}
                     pet_choices = list(pet_list.keys())
                     pet = random.choice(pet_choices)
-
-                    roll = random.randint(1, 20)
-                    dipl_value = roll + c.total_cha + (c.total_int // 3) + (c.luck // 2)
-                    dipl_value += extra_dipl
+                    roll = random.randint(1, 50)
+                    dipl_value = c.total_cha + (c.total_int // 3) + (c.luck // 2)
                     pet_reqs = pet_list[pet].get("bonuses", {}).get("req", {})
                     pet_msg4 = ""
-                    if pet_reqs.get("set", False):
+                    can_catch = True
+                    force_catch = False
+                    if any(x in c.sets for x in ["The Supreme One", "Ainz Ooal Gown"]):
+                        can_catch = True
+                        pet = random.choice(
+                            ["Albedo", "Rubedo", "Guardians of Nazarick", *random.choices(pet_choices, k=10),]
+                        )
+                        if pet in ["Albedo", "Rubedo", "Guardians of Nazarick"]:
+                            force_catch = True
+                    elif pet_reqs.get("bonuses", {}).get("req"):
                         if pet_reqs.get("set", None) in c.sets:
-                            if "Ainz Ooal Gown" == pet_reqs.get("set", None):
-                                dipl_value = 100000
-                                pet = "Guardians of Nazarick"
+                            can_catch = True
                         else:
-                            dipl_value = -100000
-                            pet_msg4 = _(
-                                "\nPerhaps you're missing some requirements to tame {pet}."
-                            ).format(pet=pet)
-
+                            can_catch = False
+                            pet_msg4 = _("\nPerhaps you're missing some requirements to tame {pet}.").format(pet=pet)
                     pet_msg = box(
-                        _("{c} is trying to tame a pet.").format(
-                            c=self.escape(ctx.author.display_name)
-                        ),
-                        lang="css",
+                        _("{c} is trying to tame a pet.").format(c=self.escape(ctx.author.display_name)), lang="css",
                     )
                     user_msg = await ctx.send(pet_msg)
                     await asyncio.sleep(2)
                     pet_msg2 = box(
-                        _(
-                            "{author} started tracking a wild {pet_name} with a roll of {dice}({roll})."
-                        ).format(
-                            dice=self.emojis.dice,
-                            author=self.escape(ctx.author.display_name),
-                            pet_name=pet,
-                            roll=roll,
+                        _("{author} started tracking a wild {pet_name} with a roll of {dice}({roll}).").format(
+                            dice=self.emojis.dice, author=self.escape(ctx.author.display_name), pet_name=pet, roll=roll,
                         ),
                         lang="css",
                     )
@@ -3591,161 +4325,143 @@ class Adventure(BaseCog):
                     bonus = ""
                     if roll == 1:
                         bonus = _("But they stepped on a twig and scared it away.")
-                    elif roll == 20:
+                    elif roll in [50, 25]:
                         bonus = _("They happen to have its favorite food.")
-                        dipl_value += 10
-                    if dipl_value > self.PETS[pet]["cha"] and roll > 1:
-                        roll = random.randint(0, 2 if roll == 20 else 4)
+                    if force_catch is (dipl_value > pet_list[pet]["cha"] and roll > 1 and can_catch):
+                        if force_catch:
+                            roll = 0
+                        else:
+                            roll = random.randint(0, 2 if roll in [50, 25] else 5)
                         if roll == 0:
-                            pet_msg3 = box(
-                                _("{bonus}\nThey successfully tamed the {pet}.").format(
-                                    bonus=bonus, pet=pet
-                                ),
-                                lang="css",
-                            )
+                            if force_catch and any(x in c.sets for x in ["The Supreme One", "Ainz Ooal Gown"]):
+                                msg = random.choice(
+                                    [
+                                        _("{author} commands {pet} into submission.").format(
+                                            pet=pet, author=self.escape(ctx.author.display_name)
+                                        ),
+                                        _("{pet} swears allegiance to the Supreme One.").format(
+                                            pet=pet, author=self.escape(ctx.author.display_name)
+                                        ),
+                                        _("{pet} takes an Oath of Allegiance to the Supreme One.").format(
+                                            pet=pet, author=self.escape(ctx.author.display_name)
+                                        ),
+                                    ]
+                                )
+                                pet_msg3 = box(msg, lang="css",)
+                            else:
+                                pet_msg3 = box(
+                                    _("{bonus}\nThey successfully tamed the {pet}.").format(bonus=bonus, pet=pet),
+                                    lang="css",
+                                )
                             await user_msg.edit(content=f"{pet_msg}\n{pet_msg2}\n{pet_msg3}")
-                            c.heroclass["pet"] = self.PETS[pet]
-                            c.heroclass["catch_cooldown"] = time.time()
+                            c.heroclass["pet"] = pet_list[pet]
+                            c.heroclass["catch_cooldown"] = time.time() + cooldown_time
                             await self.config.user(ctx.author).set(await c.to_json(self.config))
                         elif roll == 1:
                             bonus = _("But they stepped on a twig and scared it away.")
-                            pet_msg3 = box(
-                                _("{bonus}\nThe {pet} escaped.").format(bonus=bonus, pet=pet),
-                                lang="css",
-                            )
-                            await user_msg.edit(
-                                content=f"{pet_msg}\n{pet_msg2}\n{pet_msg3}{pet_msg4}"
-                            )
+                            pet_msg3 = box(_("{bonus}\nThe {pet} escaped.").format(bonus=bonus, pet=pet), lang="css",)
+                            await user_msg.edit(content=f"{pet_msg}\n{pet_msg2}\n{pet_msg3}{pet_msg4}")
                         else:
                             bonus = ""
-                            pet_msg3 = box(
-                                _("{bonus}\nThe {pet} escaped.").format(bonus=bonus, pet=pet),
-                                lang="css",
-                            )
-                            await user_msg.edit(
-                                content=f"{pet_msg}\n{pet_msg2}\n{pet_msg3}{pet_msg4}"
-                            )
+                            pet_msg3 = box(_("{bonus}\nThe {pet} escaped.").format(bonus=bonus, pet=pet), lang="css",)
+                            await user_msg.edit(content=f"{pet_msg}\n{pet_msg2}\n{pet_msg3}{pet_msg4}")
                     else:
-                        pet_msg3 = box(
-                            _("{bonus}\nThe {pet} escaped.").format(bonus=bonus, pet=pet),
-                            lang="css",
-                        )
+                        pet_msg3 = box(_("{bonus}\nThe {pet} escaped.").format(bonus=bonus, pet=pet), lang="css",)
                         await user_msg.edit(content=f"{pet_msg}\n{pet_msg2}\n{pet_msg3}{pet_msg4}")
 
     @pet.command(name="forage")
     @commands.bot_has_permissions(add_reactions=True)
-    async def _forage(self, ctx: Context):
+    async def _forage(self, ctx: commands.Context):
         """Use your pet to forage for items!"""
         if self.in_adventure(ctx):
-            return await smart_embed(
-                ctx, _("You're too distracted with the monster you are facing.")
-            )
+            return await smart_embed(ctx, _("You're too distracted with the monster you are facing."))
         async with self.get_lock(ctx.author):
             try:
-                c = await Character.from_json(self.config, ctx.author)
+                c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 return
             if c.heroclass["name"] != "Ranger":
                 return
             if not c.heroclass["pet"]:
-                return await ctx.send(
-                    box(
-                        _("{}, you need to have a pet to do this.").format(
-                            self.escape(ctx.author.display_name)
-                        ),
-                        lang="css",
+                return await smart_embed(
+                    ctx, _("**{}**, you need to have a pet to do this.").format(self.escape(ctx.author.display_name)),
+                )
+            if c.is_backpack_full(is_dev=self.is_dev(ctx.author)):
+                await ctx.send(
+                    _("**{author}**, Your backpack is currently full.").format(
+                        author=self.escape(ctx.author.display_name)
                     )
                 )
-            cooldown_time = max(1800, (7200 - (c.luck * 2 + c.total_int * 2)))
+                return
+            cooldown_time = max(1800, (7200 - max((c.luck + c.total_int) * 2, 0)))
             if "cooldown" not in c.heroclass:
                 c.heroclass["cooldown"] = cooldown_time + 1
-            if c.heroclass["cooldown"] + cooldown_time <= time.time():
+            if c.heroclass["cooldown"] <= time.time():
                 await self._open_chest(ctx, c.heroclass["pet"]["name"], "pet", character=c)
-                c.heroclass["cooldown"] = time.time()
+                c.heroclass["cooldown"] = time.time() + cooldown_time
                 await self.config.user(ctx.author).set(await c.to_json(self.config))
             else:
-                cooldown_time = (c.heroclass["cooldown"] + 7200) - time.time()
+                cooldown_time = c.heroclass["cooldown"] - time.time()
                 return await smart_embed(
                     ctx,
                     _("This command is on cooldown. Try again in {}.").format(
-                        humanize_timedelta(seconds=int(cooldown_time))
-                        if int(cooldown_time) >= 1
-                        else _("1 second")
+                        humanize_timedelta(seconds=int(cooldown_time)) if int(cooldown_time) >= 1 else _("1 second")
                     ),
                 )
 
     @pet.command(name="free")
-    async def _free(self, ctx: Context):
+    async def _free(self, ctx: commands.Context):
         """Free your pet :cry:"""
         if self.in_adventure(ctx):
-            return await smart_embed(
-                ctx, _("You're too distracted with the monster you are facing.")
-            )
+            return await smart_embed(ctx, _("You're too distracted with the monster you are facing."))
         async with self.get_lock(ctx.author):
             try:
-                c = await Character.from_json(self.config, ctx.author)
+                c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 return
             if c.heroclass["name"] != "Ranger":
-                return await ctx.send(
-                    box(
-                        _("{}, you need to be a Ranger to do this.").format(
-                            self.escape(ctx.author.display_name)
-                        ),
-                        lang="css",
-                    )
+                return await smart_embed(
+                    ctx, _("**{}**, you need to be a Ranger to do this.").format(self.escape(ctx.author.display_name)),
                 )
             if c.heroclass["pet"]:
                 c.heroclass["pet"] = {}
                 await self.config.user(ctx.author).set(await c.to_json(self.config))
-                return await ctx.send(
-                    box(
-                        _("{} released their pet into the wild.").format(
-                            self.escape(ctx.author.display_name)
-                        ),
-                        lang="css",
-                    )
+                return await smart_embed(
+                    ctx, _("**{}** released their pet into the wild..").format(self.escape(ctx.author.display_name)),
                 )
             else:
                 return await ctx.send(box(_("You don't have a pet."), lang="css"))
 
     @commands.command()
-    @commands.guild_only()
-    async def bless(self, ctx: Context):
+    async def bless(self, ctx: commands.Context):
         """[Cleric Class Only]
 
         This allows a praying Cleric to add substantial bonuses for heroes fighting the battle.
         """
         async with self.get_lock(ctx.author):
             try:
-                c = await Character.from_json(self.config, ctx.author)
+                c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 return
             if c.heroclass["name"] != "Cleric":
                 ctx.command.reset_cooldown(ctx)
                 return await smart_embed(
-                    ctx,
-                    _("**{}**, you need to be a Cleric to do this.").format(
-                        self.escape(ctx.author.display_name)
-                    ),
+                    ctx, _("**{}**, you need to be a Cleric to do this.").format(self.escape(ctx.author.display_name)),
                 )
             else:
                 if c.heroclass["ability"]:
                     return await smart_embed(
-                        ctx,
-                        _("**{}**, ability already in use.").format(
-                            self.escape(ctx.author.display_name)
-                        ),
+                        ctx, _("**{}**, ability already in use.").format(self.escape(ctx.author.display_name)),
                     )
-                cooldown_time = max(300, (1200 - ((c.luck + c.total_int) * 2)))
+                cooldown_time = max(300, (1200 - max((c.luck + c.total_int) * 2, 0)))
                 if "cooldown" not in c.heroclass:
                     c.heroclass["cooldown"] = cooldown_time + 1
-                if c.heroclass["cooldown"] + cooldown_time <= time.time():
+                if c.heroclass["cooldown"] <= time.time():
                     c.heroclass["ability"] = True
-                    c.heroclass["cooldown"] = time.time()
+                    c.heroclass["cooldown"] = time.time() + cooldown_time
                     await self.config.user(ctx.author).set(await c.to_json(self.config))
 
                     await smart_embed(
@@ -3755,28 +4471,191 @@ class Adventure(BaseCog):
                         ),
                     )
                 else:
-                    cooldown_time = (c.heroclass["cooldown"]) + cooldown_time - time.time()
+                    cooldown_time = c.heroclass["cooldown"] - time.time()
                     return await smart_embed(
                         ctx,
                         _(
-                            "Your hero is currently recovering from the last time they used this skill. Try again in {}."
+                            "Your hero is currently recovering from the last time "
+                            "they used this skill. Try again in {}."
                         ).format(
-                            humanize_timedelta(seconds=int(cooldown_time))
-                            if int(cooldown_time) >= 1
-                            else _("1 second")
+                            humanize_timedelta(seconds=int(cooldown_time)) if int(cooldown_time) >= 1 else _("1 second")
                         ),
                     )
 
     @commands.command()
     @commands.guild_only()
-    async def rage(self, ctx: Context):
+    @commands.cooldown(rate=1, per=30, type=commands.BucketType.user)
+    async def insight(self, ctx: commands.Context):
+        """[Psychic Class Only]
+        This allows a Psychic to expose the current enemy's weakeness to the party.
+        """
+        try:
+            c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
+        except Exception:
+            log.exception("Error with the new character sheet")
+            ctx.command.reset_cooldown(ctx)
+            return
+        if c.heroclass["name"] != "Psychic":
+            return await smart_embed(
+                ctx, _("**{}**, you need to be a Psychic to do this.").format(self.escape(ctx.author.display_name)),
+            )
+        else:
+            if ctx.guild.id not in self._sessions:
+                return await smart_embed(ctx, _("There are no active adventures."),)
+            if not self.in_adventure(ctx):
+                return await smart_embed(
+                    ctx, _("You tried to expose the enemy's weaknesses, but you aren't in an adventure."),
+                )
+            if c.heroclass["ability"]:
+                return await smart_embed(
+                    ctx, _("**{}**, ability already in use.").format(self.escape(ctx.author.display_name)),
+                )
+            cooldown_time = max(300, (900 - max((c.luck + c.total_cha) * 2, 0)))
+            if "cooldown" not in c.heroclass:
+                c.heroclass["cooldown"] = cooldown_time + 1
+            if c.heroclass["cooldown"] + cooldown_time <= time.time():
+                max_roll = 100 if c.rebirths >= 30 else 50 if c.rebirths >= 15 else 20
+                roll = random.randint(min(c.rebirths - 25 // 2, (max_roll // 2)), max_roll) / max_roll
+                if ctx.guild.id in self._sessions and self._sessions[ctx.guild.id].insight[0] < roll:
+                    self._sessions[ctx.guild.id].insight = roll, c
+                    good = True
+                else:
+                    good = False
+                    await smart_embed(ctx, _("Another hero has already done a better job than you."))
+                c.heroclass["ability"] = True
+                c.heroclass["cooldown"] = time.time()
+                async with self.get_lock(c.user):
+                    await self.config.user(ctx.author).set(await c.to_json(self.config))
+                    if good:
+                        await smart_embed(
+                            ctx,
+                            _("{skill} **{c}** is focusing on the monster ahead...{skill}").format(
+                                c=self.escape(ctx.author.display_name), skill=self.emojis.skills.psychic,
+                            ),
+                        )
+                if good:
+                    session = self._sessions[ctx.guild.id]
+                    if roll <= 0.4:
+                        return await smart_embed(ctx, _("You suck."))
+                    msg = ""
+                    if session.no_monster:
+                        if roll >= 0.4:
+                            msg += _("You are struggling to find anything in your current adventure.")
+                    else:
+                        pdef = session.monster_modified_stats["pdef"]
+                        mdef = session.monster_modified_stats["mdef"]
+                        cdef = session.monster_modified_stats.get("cdef", 1.0)
+                        hp = session.monster_modified_stats["hp"]
+                        diplo = session.monster_modified_stats["dipl"]
+                        if roll == 1:
+                            hp = int(hp * self.ATTRIBS[session.attribute][0] * session.monster_stats)
+                            dipl = int(diplo * self.ATTRIBS[session.attribute][1] * session.monster_stats)
+                            msg += _(
+                                "This monster is **a{attr} {challenge}** ({hp_symbol} {hp}/{dipl_symbol} {dipl}){trans}.\n"
+                            ).format(
+                                challenge=session.challenge,
+                                attr=session.attribute,
+                                hp_symbol=self.emojis.hp,
+                                hp=humanize_number(ceil(hp)),
+                                dipl_symbol=self.emojis.dipl,
+                                dipl=humanize_number(ceil(dipl)),
+                                trans=f" (**Transcended**) {self.emojis.skills.psychic}"
+                                if session.transcended
+                                else f"{self.emojis.skills.psychic}",
+                            )
+                            self._sessions[ctx.guild.id].exposed = True
+                        elif roll >= 0.95:
+                            hp = hp * self.ATTRIBS[session.attribute][0] * session.monster_stats
+                            dipl = diplo * self.ATTRIBS[session.attribute][1] * session.monster_stats
+                            msg += _(
+                                "This monster is **a{attr} {challenge}** ({hp_symbol} {hp}/{dipl_symbol} {dipl}).\n"
+                            ).format(
+                                challenge=session.challenge,
+                                attr=session.attribute,
+                                hp_symbol=self.emojis.hp,
+                                hp=humanize_number(ceil(hp)),
+                                dipl_symbol=self.emojis.dipl,
+                                dipl=humanize_number(ceil(dipl)),
+                            )
+                            self._sessions[ctx.guild.id].exposed = True
+                        elif roll >= 0.90:
+                            hp = hp * self.ATTRIBS[session.attribute][0] * session.monster_stats
+                            msg += _("This monster is **a{attr} {challenge}** ({hp_symbol} {hp}).\n").format(
+                                challenge=session.challenge,
+                                attr=session.attribute,
+                                hp_symbol=self.emojis.hp,
+                                hp=humanize_number(ceil(hp)),
+                            )
+                            self._sessions[ctx.guild.id].exposed = True
+                        elif roll > 0.75:
+                            msg += _("This monster is **a{attr} {challenge}**.\n").format(
+                                challenge=session.challenge, attr=session.attribute,
+                            )
+                            self._sessions[ctx.guild.id].exposed = True
+                        elif roll > 0.5:
+                            msg += _("This monster is **a {challenge}**.\n").format(challenge=session.challenge,)
+                            self._sessions[ctx.guild.id].exposed = True
+                        if roll >= 0.4:
+                            if pdef >= 1.5:
+                                msg += _("Swords bounce off this monster as it's skin is **almost impenetrable!**\n")
+                            elif pdef >= 1.25:
+                                msg += _("This monster has **extremely tough** armour!\n")
+                            elif pdef > 1:
+                                msg += _("Swords don't cut this monster **quite as well!**\n")
+                            elif pdef > 0.75:
+                                msg += _("This monster is **soft and easy** to slice!\n")
+                            else:
+                                msg += _("Swords slice through this monster like a **hot knife through butter!**\n")
+                        if roll >= 0.6:
+                            if mdef >= 1.5:
+                                msg += _("Magic? Pfft, magic is **no match** for this creature!\n")
+                            elif mdef >= 1.25:
+                                msg += _("This monster has **substantial magic resistance!**\n")
+                            elif mdef > 1:
+                                msg += _("This monster has increased **magic resistance!**\n")
+                            elif mdef > 0.75:
+                                msg += _("This monster's hide **melts to magic!**\n")
+                            else:
+                                msg += _("Magic spells are **hugely effective** against this monster!\n")
+                        if roll >= 0.8:
+                            if cdef >= 1.5:
+                                msg += _(
+                                    "You think you are charismatic? Pfft, this creature couldn't care less for what you want to say!\n"
+                                )
+                            elif cdef >= 1.25:
+                                msg += _("Any attempts to communicate with this creature will be **very difficult!**\n")
+                            elif cdef > 1:
+                                msg += _("Any attempts to talk to this creature will be **difficult!**\n")
+                            elif cdef > 0.75:
+                                msg += _("This creature **can be reasoned** with!\n")
+                            else:
+                                msg += _("This monster can be **easily influenced!**\n")
+
+                    if msg:
+                        image = None
+                        if roll >= 0.4:
+                            image = session.monster["image"]
+                        return await smart_embed(ctx, msg, image=image)
+                    else:
+                        return await smart_embed(ctx, _("You have failed to discover anything about this monster."))
+            else:
+                cooldown_time = (c.heroclass["cooldown"]) + cooldown_time - time.time()
+                return await smart_embed(
+                    ctx,
+                    _(
+                        "Your hero is currently recovering from the last time they used this skill. Try again in {}."
+                    ).format(humanize_timedelta(seconds=int(cooldown_time))),
+                )
+
+    @commands.command()
+    async def rage(self, ctx: commands.Context):
         """[Berserker Class Only]
 
         This allows a Berserker to add substantial attack bonuses for one battle.
         """
         async with self.get_lock(ctx.author):
             try:
-                c = await Character.from_json(self.config, ctx.author)
+                c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 return
@@ -3784,137 +4663,114 @@ class Adventure(BaseCog):
                 ctx.command.reset_cooldown(ctx)
                 return await smart_embed(
                     ctx,
-                    _("**{}**, you need to be a Berserker to do this.").format(
-                        self.escape(ctx.author.display_name)
-                    ),
+                    _("**{}**, you need to be a Berserker to do this.").format(self.escape(ctx.author.display_name)),
                 )
             else:
                 if c.heroclass["ability"] is True:
                     return await smart_embed(
-                        ctx,
-                        _("**{}**, ability already in use.").format(
-                            self.escape(ctx.author.display_name)
-                        ),
+                        ctx, _("**{}**, ability already in use.").format(self.escape(ctx.author.display_name)),
                     )
-                cooldown_time = max(300, (1200 - ((c.luck + c.total_att) * 2)))
+                cooldown_time = max(300, (1200 - max((c.luck + c.total_att) * 2, 0)))
                 if "cooldown" not in c.heroclass:
                     c.heroclass["cooldown"] = cooldown_time + 1
-                if c.heroclass["cooldown"] + cooldown_time <= time.time():
+                if c.heroclass["cooldown"] <= time.time():
                     c.heroclass["ability"] = True
-                    c.heroclass["cooldown"] = time.time()
+                    c.heroclass["cooldown"] = time.time() + cooldown_time
                     await self.config.user(ctx.author).set(await c.to_json(self.config))
                     await smart_embed(
                         ctx,
                         _("{skill} **{c}** is starting to froth at the mouth... {skill}").format(
-                            c=self.escape(ctx.author.display_name),
-                            skill=self.emojis.skills.berserker,
+                            c=self.escape(ctx.author.display_name), skill=self.emojis.skills.berserker,
                         ),
                     )
                 else:
-                    cooldown_time = (c.heroclass["cooldown"]) + cooldown_time - time.time()
+                    cooldown_time = c.heroclass["cooldown"] - time.time()
                     return await smart_embed(
                         ctx,
                         _(
-                            "Your hero is currently recovering from the last time they used this skill. Try again in {}."
+                            "Your hero is currently recovering from the last time "
+                            "they used this skill. Try again in {}."
                         ).format(
-                            humanize_timedelta(seconds=int(cooldown_time))
-                            if int(cooldown_time) >= 1
-                            else _("1 second")
+                            humanize_timedelta(seconds=int(cooldown_time)) if int(cooldown_time) >= 1 else _("1 second")
                         ),
                     )
 
     @commands.command()
-    @commands.guild_only()
-    async def focus(self, ctx: Context):
+    async def focus(self, ctx: commands.Context):
         """[Wizard Class Only]
 
         This allows a Wizard to add substantial magic bonuses for one battle.
         """
         async with self.get_lock(ctx.author):
             try:
-                c = await Character.from_json(self.config, ctx.author)
+                c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 return
             if c.heroclass["name"] != "Wizard":
                 ctx.command.reset_cooldown(ctx)
                 return await smart_embed(
-                    ctx,
-                    _("**{}**, you need to be a Wizard to do this.").format(
-                        self.escape(ctx.author.display_name)
-                    ),
+                    ctx, _("**{}**, you need to be a Wizard to do this.").format(self.escape(ctx.author.display_name)),
                 )
             else:
                 if c.heroclass["ability"] is True:
                     return await smart_embed(
-                        ctx,
-                        _("**{}**, ability already in use.").format(
-                            self.escape(ctx.author.display_name)
-                        ),
+                        ctx, _("**{}**, ability already in use.").format(self.escape(ctx.author.display_name)),
                     )
-                cooldown_time = max(300, (1200 - ((c.luck + c.total_int) * 2)))
+                cooldown_time = max(300, (1200 - max((c.luck + c.total_int) * 2, 0)))
                 if "cooldown" not in c.heroclass:
                     c.heroclass["cooldown"] = cooldown_time + 1
-                if c.heroclass["cooldown"] + cooldown_time <= time.time():
+                if c.heroclass["cooldown"] <= time.time():
                     c.heroclass["ability"] = True
-                    c.heroclass["cooldown"] = time.time()
+                    c.heroclass["cooldown"] = time.time() + cooldown_time
 
                     await self.config.user(ctx.author).set(await c.to_json(self.config))
                     await smart_embed(
                         ctx,
                         _("{skill} **{c}** is focusing all of their energy... {skill}").format(
-                            c=self.escape(ctx.author.display_name),
-                            skill=self.emojis.skills.wizzard,
+                            c=self.escape(ctx.author.display_name), skill=self.emojis.skills.wizzard,
                         ),
                     )
                 else:
-                    cooldown_time = (c.heroclass["cooldown"]) + cooldown_time - time.time()
+                    cooldown_time = c.heroclass["cooldown"] - time.time()
                     return await smart_embed(
                         ctx,
                         _(
-                            "Your hero is currently recovering from the last time they used this skill. Try again in {}."
+                            "Your hero is currently recovering from the "
+                            "last time they used this skill. Try again in {}."
                         ).format(
-                            humanize_timedelta(seconds=int(cooldown_time))
-                            if int(cooldown_time) >= 1
-                            else _("1 second")
+                            humanize_timedelta(seconds=int(cooldown_time)) if int(cooldown_time) >= 1 else _("1 second")
                         ),
                     )
 
     @commands.command()
-    @commands.guild_only()
-    async def music(self, ctx: Context):
+    async def music(self, ctx: commands.Context):
         """[Bard Class Only]
 
         This allows a Bard to add substantial diplomacy bonuses for one battle.
         """
         async with self.get_lock(ctx.author):
             try:
-                c = await Character.from_json(self.config, ctx.author)
+                c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 return
             if c.heroclass["name"] != "Bard":
                 ctx.command.reset_cooldown(ctx)
                 return await smart_embed(
-                    ctx,
-                    _("{}, you need to be a Bard to do this.").format(
-                        self.escape(ctx.author.display_name)
-                    ),
+                    ctx, _("**{}**, you need to be a Bard to do this.").format(self.escape(ctx.author.display_name)),
                 )
             else:
                 if c.heroclass["ability"]:
                     return await smart_embed(
-                        ctx,
-                        _("{}, ability already in use.").format(
-                            self.escape(ctx.author.display_name)
-                        ),
+                        ctx, _("**{}**, ability already in use.").format(self.escape(ctx.author.display_name)),
                     )
-                cooldown_time = max(300, (1200 - ((c.luck + c.total_cha) * 2)))
+                cooldown_time = max(300, (1200 - max((c.luck + c.total_cha) * 2, 0)))
                 if "cooldown" not in c.heroclass:
                     c.heroclass["cooldown"] = cooldown_time + 1
-                if c.heroclass["cooldown"] + cooldown_time <= time.time():
+                if c.heroclass["cooldown"] <= time.time():
                     c.heroclass["ability"] = True
-                    c.heroclass["cooldown"] = time.time()
+                    c.heroclass["cooldown"] = time.time() + cooldown_time
                     await self.config.user(ctx.author).set(await c.to_json(self.config))
                     await smart_embed(
                         ctx,
@@ -3923,17 +4779,18 @@ class Adventure(BaseCog):
                         ),
                     )
                 else:
-                    cooldown_time = (c.heroclass["cooldown"]) + cooldown_time - time.time()
+                    cooldown_time = c.heroclass["cooldown"] - time.time()
                     return await smart_embed(
                         ctx,
                         _(
-                            "Your hero is currently recovering from the last time they used this skill. Try again in {}."
+                            "Your hero is currently recovering from the last time "
+                            "they used this skill. Try again in {}."
                         ).format(humanize_timedelta(seconds=int(cooldown_time))),
                     )
 
     @commands.command()
     @commands.cooldown(rate=1, per=2, type=commands.BucketType.user)
-    async def skill(self, ctx: Context, spend: str = None, amount: int = 1):
+    async def skill(self, ctx: commands.Context, spend: str = None, amount: int = 1):
         """This allows you to spend skillpoints.
 
         `[p]skill attack/charisma/intelligence`
@@ -3941,10 +4798,7 @@ class Adventure(BaseCog):
         """
         if self.in_adventure(ctx):
             return await smart_embed(
-                ctx,
-                _(
-                    "The skill cleric is back in town and the monster ahead of you is demanding your attention."
-                ),
+                ctx, _("The skill cleric is back in town and the monster ahead of you is demanding your attention."),
             )
         if not await self.allow_in_dm(ctx):
             return await smart_embed(ctx, _("This command is not available in DM's on this bot."))
@@ -3952,19 +4806,24 @@ class Adventure(BaseCog):
             return await smart_embed(ctx, _("Nice try :smirk:"))
         async with self.get_lock(ctx.author):
             try:
-                c = await Character.from_json(self.config, ctx.author)
+                c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 return
             if spend == "reset":
                 last_reset = await self.config.user(ctx.author).last_skill_reset()
                 if last_reset + 3600 > time.time():
-                    return await smart_embed(
-                        ctx, _("You reset your skills within the last hour, try again later.")
-                    )
+                    return await smart_embed(ctx, _("You reset your skills within the last hour, try again later."))
                 bal = c.bal
-                currency_name = await bank.get_currency_name(ctx.guild)
+                currency_name = await bank.get_currency_name(ctx.guild,)
                 offering = min(int(bal / 5 + (c.total_int // 3)), 1000000000)
+                if not await bank.can_spend(ctx.author, offering):
+                    return await smart_embed(
+                        ctx,
+                        _("{author.mention}, you don't have enough {name}.").format(
+                            author=ctx.author, name=await bank.get_currency_name(ctx.guild)
+                        ),
+                    )
                 nv_msg = await ctx.send(
                     _(
                         "{author}, this will cost you at least {offering} {currency_name}.\n"
@@ -3993,41 +4852,32 @@ class Adventure(BaseCog):
                     await self.config.user(ctx.author).last_skill_reset.set(int(time.time()))
                     await bank.withdraw_credits(ctx.author, offering)
                     await smart_embed(
-                        ctx,
-                        _("{}, your skill points have been reset.").format(
-                            self.escape(ctx.author.display_name)
-                        ),
+                        ctx, _("{}, your skill points have been reset.").format(self.escape(ctx.author.display_name)),
                     )
                 else:
                     await smart_embed(
-                        ctx,
-                        _("Don't play games with me, {}.").format(
-                            self.escape(ctx.author.display_name)
-                        ),
+                        ctx, _("Don't play games with me, {}.").format(self.escape(ctx.author.display_name)),
                     )
                 return
 
             if c.skill["pool"] <= 0:
                 return await smart_embed(
-                    ctx,
-                    _("{}, you do not have unspent skillpoints.").format(
-                        self.escape(ctx.author.display_name)
-                    ),
+                    ctx, _("{}, you do not have unspent skillpoints.").format(self.escape(ctx.author.display_name)),
                 )
             elif c.skill["pool"] < amount:
                 return await smart_embed(
                     ctx,
-                    _("{}, you do not have enough unspent skillpoints.").format(
-                        self.escape(ctx.author.display_name)
-                    ),
+                    _("{}, you do not have enough unspent skillpoints.").format(self.escape(ctx.author.display_name)),
                 )
             if spend is None:
                 await smart_embed(
                     ctx,
                     _(
                         "**{author}**, you currently have **{skillpoints}** unspent skillpoints.\n"
-                        "If you want to put them towards a permanent attack, charisma or intelligence bonus, use "
-                        "`{prefix}skill attack`, `{prefix}skill charisma` or  `{prefix}skill intelligence`"
+                        "If you want to put them towards a permanent attack, "
+                        "charisma or intelligence bonus, use "
+                        "`{prefix}skill attack`, `{prefix}skill charisma` or "
+                        "`{prefix}skill intelligence`"
                     ).format(
                         author=self.escape(ctx.author.display_name),
                         skillpoints=str(c.skill["pool"]),
@@ -4062,9 +4912,104 @@ class Adventure(BaseCog):
                     ),
                 )
 
+    @commands.command(name="setinfo")
+    @commands.bot_has_permissions(add_reactions=True, embed_links=True)
+    async def set_show(self, ctx: commands.Context, *, set_name: str = None):
+        """Show set bonuses for the specified set."""
+
+        set_list = humanize_list(sorted([f"`{i}`" for i in self.SET_BONUSES.keys()], key=str.lower))
+        if set_name is None:
+            return await smart_embed(
+                ctx, _("Use this command with one of the following set names: \n{sets}").format(sets=set_list),
+            )
+
+        title_cased_set_name = await self._title_case(set_name)
+        sets = self.SET_BONUSES.get(title_cased_set_name)
+        if sets is None:
+            return await smart_embed(
+                ctx,
+                _("`{input}` is not a valid set.\n\nPlease use one of the following full set names: \n{sets}").format(
+                    input=title_cased_set_name, sets=set_list
+                ),
+            )
+
+        try:
+            c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
+        except Exception as exc:
+            log.exception("Error with the new character sheet", exc_info=exc)
+            return
+
+        bonus_list = sorted(sets, key=itemgetter("parts"))
+        msg_list = []
+        for bonus in bonus_list:
+            parts = bonus.get("parts", 0)
+            attack = bonus.get("att", 0)
+            charisma = bonus.get("cha", 0)
+            intelligence = bonus.get("int", 0)
+            dexterity = bonus.get("dex", 0)
+            luck = bonus.get("luck", 0)
+
+            attack = f"+{attack}" if attack > 0 else f"{attack}"
+            charisma = f"+{charisma}" if charisma > 0 else f"{charisma}"
+            intelligence = f"+{intelligence}" if intelligence > 0 else f"{intelligence}"
+            dexterity = f"+{dexterity}" if dexterity > 0 else f"{dexterity}"
+            luck = f"+{luck}" if luck > 0 else f"{luck}"
+
+            statmult = round((bonus.get("statmult", 1) - 1) * 100)
+            xpmult = round((bonus.get("xpmult", 1) - 1) * 100)
+            cpmult = round((bonus.get("cpmult", 1) - 1) * 100)
+
+            statmult = f"+{statmult}%" if statmult > 0 else f"{statmult}%"
+            xpmult = f"+{xpmult}%" if xpmult > 0 else f"{xpmult}%"
+            cpmult = f"+{cpmult}%" if cpmult > 0 else f"{cpmult}%"
+
+            breakdown = _(
+                "Attack:                [{attack}]\n"
+                "Charisma:              [{charisma}]\n"
+                "Intelligence:          [{intelligence}]\n"
+                "Dexterity:             [{dexterity}]\n"
+                "Luck:                  [{luck}]\n"
+                "Stat Mulitplier:       [{statmult}]\n"
+                "XP Multiplier:         [{xpmult}]\n"
+                "Currency Multiplier:   [{cpmult}]\n\n"
+            ).format(
+                attack=attack,
+                charisma=charisma,
+                intelligence=intelligence,
+                dexterity=dexterity,
+                luck=luck,
+                statmult=statmult,
+                xpmult=xpmult,
+                cpmult=cpmult,
+            )
+            stats_msg = _("{set_name} - {part_val} Part Bonus\n\n").format(
+                set_name=title_cased_set_name, part_val=parts
+            )
+            stats_msg += breakdown
+            stats_msg += "Multiple complete set bonuses stack."
+            msg_list.append(box(stats_msg, lang="ini"))
+        set_items = {key: value for key, value in self.TR_GEAR_SET.items() if value["set"] == title_cased_set_name}
+
+        d = {}
+        for k, v in set_items.items():
+            if len(v["slot"]) > 1:
+                d.update({v["slot"][0]: {k: v}})
+                d.update({v["slot"][1]: {k: v}})
+            else:
+                d.update({v["slot"][0]: {k: v}})
+
+        loadout_display = await self._build_loadout_display({"items": d}, loadout=False, rebirths=c.rebirths)
+        set_msg = _("{set_name} Set Pieces\n\n").format(set_name=title_cased_set_name)
+        set_msg += loadout_display
+        msg_list.append(box(set_msg, lang="css"))
+        backpack_contents = await c.get_backpack(set_name=title_cased_set_name, clean=True)
+        if backpack_contents:
+            msg_list.extend(backpack_contents)
+        await menu(ctx, pages=msg_list, controls=DEFAULT_CONTROLS)
+
     @commands.command()
     @commands.bot_has_permissions(add_reactions=True)
-    async def stats(self, ctx: Context, *, user: discord.Member = None):
+    async def stats(self, ctx: commands.Context, *, user: discord.User = None):
         """This draws up a character sheet of you or an optionally specified member."""
         if not await self.allow_in_dm(ctx):
             return await smart_embed(ctx, _("This command is not available in DM's on this bot."))
@@ -4073,84 +5018,168 @@ class Adventure(BaseCog):
         if user.bot:
             return
         try:
-            c = await Character.from_json(self.config, user)
+            c = await Character.from_json(self.config, user, self._daily_bonus)
         except Exception:
             log.exception("Error with the new character sheet")
             return
-        msg = await ctx.send(box(c, lang="css"))
-        try:
-            await msg.add_reaction("\N{CROSS MARK}")
-        except discord.errors.Forbidden:
-            return
-        pred = ReactionPredicate.same_context(msg, ctx.author)
-        try:
-            react, user = await self.bot.wait_for("reaction_add", check=pred, timeout=60)
-        except asyncio.TimeoutError:
-            return
-        if str(react.emoji) == "\N{CROSS MARK}":
-            await msg.delete()
+        items = c.get_current_equipment(return_place_holder=True)
+        msg = _("{}'s Character Sheet\n\n").format(self.escape(ctx.author.display_name))
+        msg_len = len(msg)
+        items_names = set()
+        table = BeautifulTable(default_alignment=ALIGN_LEFT, maxwidth=500)
+        table.set_style(BeautifulTable.STYLE_RST)
+        msgs = []
+        total = len(items)
+        table.columns.header = [
+            "Name",
+            "Slot",
+            "ATT",
+            "CHA",
+            "INT",
+            "DEX",
+            "LUC",
+            "LVL",
+            "QTY",
+            "DEG",
+            "SET",
+        ]
+        async for index, item in AsyncIter(items, steps=100).enumerate(start=1):
+            if len(str(table)) > 1500:
+                msgs.append(box(msg + str(table) + f"\nPage {len(msgs) + 1}", lang="css"))
+                table = BeautifulTable(default_alignment=ALIGN_LEFT, maxwidth=500)
+                table.set_style(BeautifulTable.STYLE_RST)
+                table.columns.header = [
+                    "Name",
+                    "Slot",
+                    "ATT",
+                    "CHA",
+                    "INT",
+                    "DEX",
+                    "LUC",
+                    "LVL",
+                    "QTY",
+                    "DEG",
+                    "SET",
+                ]
+            item_name = str(item)
+            slots = len(item.slot)
+            slot_name = item.slot[0] if slots == 1 else "two handed"
+            if (item_name, slots, slot_name) in items_names:
+                continue
+            items_names.add((item_name, slots, slot_name))
+            data = (
+                item_name,
+                slot_name,
+                item.att * (1 if slots == 1 else 2),
+                item.cha * (1 if slots == 1 else 2),
+                item.int * (1 if slots == 1 else 2),
+                item.dex * (1 if slots == 1 else 2),
+                item.luck * (1 if slots == 1 else 2),
+                f"[{r}]" if (r := equip_level(c, item)) is not None and r > c.lvl else f"{r}",
+                item.owned,
+                f"[{item.degrade}]"
+                if item.rarity in ["legendary", "event", "ascended"] and item.degrade >= 0
+                else "N/A",
+                item.set or "N/A",
+            )
+            if data not in table.rows:
+                table.rows.append(data)
+            if index == total:
+                table.set_style(BeautifulTable.STYLE_RST)
+                msgs.append(box(msg + str(table) + f"\nPage {len(msgs) + 1}", lang="css"))
 
-    async def _build_loadout_display(self, userdata):
-        form_string = _("( ATT  |  CHA  |  INT  |  DEX  |  LUCK)\nItems Equipped:")
+        await menu(
+            ctx, pages=[box(c, lang="css"), *msgs], controls=DEFAULT_CONTROLS,
+        )
+
+    async def _build_loadout_display(self, userdata, loadout=True, rebirths: int = None, index: int = None):
+        table = BeautifulTable(default_alignment=ALIGN_LEFT, maxwidth=500)
+        table.set_style(BeautifulTable.STYLE_RST)
+        table.columns.header = [
+            "Name",
+            "Slot",
+            "ATT",
+            "CHA",
+            "INT",
+            "DEX",
+            "LUC",
+            "LVL",
+            "SET",
+        ]
+        form_string = ""
         last_slot = ""
         att = 0
         cha = 0
         intel = 0
         dex = 0
         luck = 0
-        for (slot, data) in userdata["items"].items():
 
+        def get_slot_index(slot):
+            slot = slot[0]
+            if slot not in ORDER:
+                return float("inf")
+            return ORDER.index(slot)
+
+        data_sorted = sorted(userdata["items"].items(), key=get_slot_index)
+        items_names = set()
+        for (slot, data) in data_sorted:
             if slot == "backpack":
                 continue
             if last_slot == "two handed":
                 last_slot = slot
                 continue
-
             if not data:
-                last_slot = slot
-                form_string += _("\n\n {} slot").format(slot.title())
                 continue
             item = Item.from_json(data)
-            slot_name = userdata["items"][slot]["".join(i for i in data.keys())]["slot"]
-            slot_name = slot_name[0] if len(slot_name) < 2 else _("two handed")
-            form_string += _("\n\n {} slot").format(slot_name.title())
-            last_slot = slot_name
-            rjust = max([len(i) for i in data.keys()])
-            form_string += f"\n  - {str(item):<{rjust}} - "
-            form_string += (
-                f"({item.att if len(item.slot) < 2 else (item.att * 2)} | "
-                f"{item.cha if len(item.slot) < 2 else (item.cha * 2)} | "
-                f"{item.int if len(item.slot) < 2 else (item.int * 2)} | "
-                f"{item.dex if len(item.slot) < 2 else (item.dex * 2)} | "
-                f"{item.luck if len(item.slot) < 2 else (item.luck * 2)})"
+            item_name = str(item)
+            slots = len(item.slot)
+            slot_name = item.slot[0] if slots == 1 else "two handed"
+            if (item_name, slots, slot_name) in items_names:
+                continue
+            items_names.add((item_name, slots, slot_name))
+            data = (
+                item_name,
+                slot_name,
+                item.att * (1 if slots == 1 else 2),
+                item.cha * (1 if slots == 1 else 2),
+                item.int * (1 if slots == 1 else 2),
+                item.dex * (1 if slots == 1 else 2),
+                item.luck * (1 if slots == 1 else 2),
+                equip_level(None, item, rebirths),
+                item.set or "N/A",
             )
-            att += item.att if len(item.slot) < 2 else (item.att * 2)
-            cha += item.cha if len(item.slot) < 2 else (item.cha * 2)
-            intel += item.int if len(item.slot) < 2 else (item.int * 2)
-            dex += item.dex if len(item.slot) < 2 else (item.dex * 2)
-            luck += item.luck if len(item.slot) < 2 else (item.luck * 2)
+            if data not in table.rows:
+                table.rows.append(data)
+            att += item.att
+            cha += item.cha
+            intel += item.int
+            dex += item.dex
+            luck += item.luck
+
+        table.set_style(BeautifulTable.STYLE_RST)
+        form_string += str(table)
+
         form_string += _("\n\nTotal stats: ")
         form_string += f"({att} | {cha} | {intel} | {dex} | {luck})"
-        return form_string + "\n"
+        if index is not None:
+            form_string += f"\nPage {index}"
+        return form_string
 
     @commands.command()
-    async def unequip(self, ctx: Context, *, item: EquipmentConverter):
+    async def unequip(self, ctx: commands.Context, *, item: EquipmentConverter):
         """This stashes a specified equipped item into your backpack.
 
         Use `[p]unequip name of item` or `[p]unequip slot`
         """
         if self.in_adventure(ctx):
             return await smart_embed(
-                ctx,
-                _(
-                    "You tried to unequip your items, but the monster ahead of you looks mighty hungry..."
-                ),
+                ctx, _("You tried to unequip your items, but the monster ahead of you looks mighty hungry..."),
             )
         if not await self.allow_in_dm(ctx):
             return await smart_embed(ctx, _("This command is not available in DM's on this bot."))
         async with self.get_lock(ctx.author):
             try:
-                c = await Character.from_json(self.config, ctx.author)
+                c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 return
@@ -4168,25 +5197,28 @@ class Adventure(BaseCog):
                 "charm",
             ]
             msg = ""
-
-            if item in slots:
+            if isinstance(item, list):
+                for i in item:
+                    await c.unequip_item(i)
+                msg = _("{author} unequipped all their items and put them into their backpack.").format(
+                    author=self.escape(ctx.author.display_name)
+                )
+            elif item in slots:
                 current_item = getattr(c, item, None)
                 if not current_item:
-                    msg = _(
-                        "{author}, you do not have an item equipped in the {item} slot."
-                    ).format(author=self.escape(ctx.author.display_name), item=item)
+                    msg = _("{author}, you do not have an item equipped in the {item} slot.").format(
+                        author=self.escape(ctx.author.display_name), item=item
+                    )
                     return await ctx.send(box(msg, lang="css"))
                 await c.unequip_item(current_item)
-                msg = _(
-                    "{author} removed the {current_item} and put it into their backpack."
-                ).format(author=self.escape(ctx.author.display_name), current_item=current_item)
+                msg = _("{author} removed the {current_item} and put it into their backpack.").format(
+                    author=self.escape(ctx.author.display_name), current_item=current_item
+                )
             else:
                 for current_item in c.get_current_equipment():
                     if item.name.lower() in current_item.name.lower():
                         await c.unequip_item(current_item)
-                        msg = _(
-                            "{author} removed the {current_item} and put it into their backpack."
-                        ).format(
+                        msg = _("{author} removed the {current_item} and put it into their backpack.").format(
                             author=self.escape(ctx.author.display_name), current_item=current_item
                         )
                         # We break if this works because unequip
@@ -4206,14 +5238,17 @@ class Adventure(BaseCog):
     @commands.command(name="adventurestats")
     @commands.bot_has_permissions(add_reactions=True, embed_links=True)
     @commands.is_owner()
-    async def _adventurestats(self, ctx: Context):
+    async def _adventurestats(self, ctx: commands.Context):
         """[Owner] Show all current adventures."""
         msg = "**Active Adventures**\n"
         embed_list = []
 
         if len(self._sessions) > 0:
             for server_id, adventure in self._sessions.items():
-                msg += f"{self.bot.get_guild(server_id).name} - [{adventure.challenge}]({adventure.message.jump_url})\n"
+                msg += (
+                    f"{self.bot.get_guild(server_id).name} - "
+                    f"[{adventure.challenge}]({adventure.message.jump_url})\n"
+                )
         else:
             msg += "None."
         for page in pagify(msg, delims=["\n"], page_length=1000):
@@ -4227,15 +5262,18 @@ class Adventure(BaseCog):
     @commands.command(name="devcooldown")
     @commands.bot_has_permissions(add_reactions=True)
     @commands.is_owner()
-    async def _devcooldown(self, ctx: Context):
-        """[Owner] Resets the after-adventure cooldown in this server."""
+    async def _devcooldown(self, ctx: commands.Context):
+        """[Dev] Resets the after-adventure cooldown in this server."""
+        if not await no_dev_prompt(ctx):
+            return
         await self.config.guild(ctx.guild).cooldown.set(0)
         await ctx.tick()
 
+    @commands.cooldown(rate=1, per=5, type=commands.BucketType.guild)
     @commands.command(name="adventure", aliases=["a"])
     @commands.bot_has_permissions(add_reactions=True)
     @commands.guild_only()
-    async def _adventure(self, ctx: Context, *, challenge=None):
+    async def _adventure(self, ctx: commands.Context, *, challenge=None):
         """This will send you on an adventure!
 
         You play by reacting with the offered emojis.
@@ -4245,35 +5283,39 @@ class Adventure(BaseCog):
             adventure_obj = self._sessions[ctx.guild.id]
             link = adventure_obj.message.jump_url
 
+            challenge = adventure_obj.challenge if (adventure_obj.easy_mode or adventure_obj.exposed) else _("Unknown")
             return await smart_embed(
                 ctx,
                 _(
-                    f"There's already another adventure going on in this server.\nCurrently fighting: [{adventure_obj.challenge}]({link})"
+                    f"There's already another adventure going on in this server.\n"
+                    f"Currently fighting: [{challenge}]({link})"
                 ),
             )
 
         if not await has_funds(ctx.author, 250):
-            currency_name = await bank.get_currency_name(ctx.guild)
+            currency_name = await bank.get_currency_name(ctx.guild,)
+            extra = (
+                _("\nRun `{ctx.clean_prefix}apayday` to get some gold.").format(ctx=ctx)
+                if self._separate_economy
+                else ""
+            )
             return await smart_embed(
                 ctx,
-                _("You need {req} {name} to start an adventure.").format(
-                    req=250, name=currency_name
+                _("You need {req} {name} to start an adventure.{extra}").format(
+                    req=250, name=currency_name, extra=extra
                 ),
             )
         guild_settings = await self.config.guild(ctx.guild).all()
         cooldown = guild_settings["cooldown"]
 
         cooldown_time = guild_settings["cooldown_timer_manual"]
-        cooldown_time = cooldown_time
 
         if cooldown + cooldown_time > time.time():
             cooldown_time = cooldown + cooldown_time - time.time()
             return await smart_embed(
                 ctx,
                 _("No heroes are ready to depart in an adventure, try again in {}.").format(
-                    humanize_timedelta(seconds=int(cooldown_time))
-                    if int(cooldown_time) >= 1
-                    else _("1 second")
+                    humanize_timedelta(seconds=int(cooldown_time)) if int(cooldown_time) >= 1 else _("1 second")
                 ),
             )
 
@@ -4281,15 +5323,15 @@ class Adventure(BaseCog):
             # Only let the bot owner specify a specific challenge
             challenge = None
 
-        adventure_msg = _("You feel adventurous, **{}**?").format(
-            self.escape(ctx.author.display_name)
-        )
+        adventure_msg = _("You feel adventurous, **{}**?").format(self.escape(ctx.author.display_name))
         try:
             reward, participants = await self._simple(ctx, adventure_msg, challenge)
             await self.config.guild(ctx.guild).cooldown.set(time.time())
         except Exception as exc:
             await self.config.guild(ctx.guild).cooldown.set(0)
             log.exception("Something went wrong controlling the game", exc_info=exc)
+            while ctx.guild.id in self._sessions:
+                del self._sessions[ctx.guild.id]
             return
         if not reward and not participants:
             await self.config.guild(ctx.guild).cooldown.set(0)
@@ -4297,61 +5339,83 @@ class Adventure(BaseCog):
                 del self._sessions[ctx.guild.id]
             return
         reward_copy = reward.copy()
+        send_message = ""
         for (userid, rewards) in reward_copy.items():
             if rewards:
                 user = ctx.guild.get_member(userid)  # bot.get_user breaks sometimes :ablobsweats:
                 if user is None:
                     # sorry no rewards if you leave the server
                     continue
-                await self._add_rewards(
-                    ctx, user, rewards["xp"], rewards["cp"], rewards["special"]
-                )
+                msg = await self._add_rewards(ctx, user, rewards["xp"], rewards["cp"], rewards["special"])
+                if msg:
+                    send_message += f"{msg}\n"
                 self._rewards[userid] = {}
+        if send_message:
+            for page in pagify(send_message):
+                await smart_embed(ctx, page, success=True)
         if participants:
             for user in participants:  # reset activated abilities
                 async with self.get_lock(user):
                     try:
-                        c = await Character.from_json(self.config, user)
+                        c = await Character.from_json(self.config, user, self._daily_bonus)
                     except Exception as exc:
                         log.exception("Error with the new character sheet", exc_info=exc)
                         continue
                     if c.heroclass["name"] != "Ranger" and c.heroclass["ability"]:
                         c.heroclass["ability"] = False
-                        await self.config.user(user).set(await c.to_json(self.config))
-
+                    if c.last_currency_check + 600 < time.time() or c.bal > c.last_known_currency:
+                        c.last_known_currency = await bank.get_balance(user)
+                        c.last_currency_check = time.time()
+                    await self.config.user(user).set(await c.to_json(self.config))
+        if ctx.message.id in self._reward_message:
+            extramsg = self._reward_message.pop(ctx.message.id)
+            if extramsg:
+                for msg in pagify(extramsg, page_length=1900):
+                    await smart_embed(ctx, msg, success=True)
         while ctx.guild.id in self._sessions:
             del self._sessions[ctx.guild.id]
 
     @_adventure.error
     async def _error_handler(self, ctx: commands.Context, error: Exception) -> None:
         error = getattr(error, "original", error)
+        handled = False
         if not isinstance(
             error,
-            (
-                commands.CheckFailure,
-                commands.UserInputError,
-                commands.DisabledCommand,
-                commands.CommandOnCooldown,
-            ),
+            (commands.CheckFailure, commands.UserInputError, commands.DisabledCommand, commands.CommandOnCooldown,),
         ):
             while ctx.guild.id in self._sessions:
                 del self._sessions[ctx.guild.id]
+            handled = False
+        elif isinstance(error, RuntimeError):
+            handled = True
 
-        await ctx.bot.on_command_error(ctx, error, unhandled_by_cog=True)
+        await ctx.bot.on_command_error(ctx, error, unhandled_by_cog=not handled)
 
-    async def get_challenge(self, ctx: Context, monsters):
+    async def cog_command_error(self, ctx: commands.Context, error: Exception) -> None:
+        error = getattr(error, "original", error)
+        handled = False
+        if hasattr(ctx.command, "on_error"):
+            return
+        if isinstance(error, adventure.charsheet.ArgParserFailure):
+            handled = True
+            msg = _("`{command}` {message}").format(message=error.message, command=error.cmd,)
+            await ctx.send(msg)
+
+        await ctx.bot.on_command_error(ctx, error, unhandled_by_cog=not handled)
+
+    async def get_challenge(self, ctx: commands.Context, monsters):
         try:
-            c = await Character.from_json(self.config, ctx.author)
+            c = await Character.from_json(self.config, ctx.author, self._daily_bonus)
         except Exception as exc:
             log.exception("Error with the new character sheet", exc_info=exc)
             return
         possible_monsters = []
         stat_range = self._adv_results.get_stat_range(ctx)
-        for (e, (m, stats)) in enumerate(monsters.items(), 1):
-            appropriate_range = max(stats["hp"], stats["dipl"]) <= (max(c.att, c.int, c.cha) * 3)
+        async for (e, (m, stats)) in AsyncIter(monsters.items(), steps=100).enumerate(start=1):
+            appropriate_range = max(stats["hp"], stats["dipl"]) <= (max(c.att, c.int, c.cha) * 5)
             if stat_range["max_stat"] > 0:
                 main_stat = stats["hp"] if (stat_range["stat_type"] == "attack") else stats["dipl"]
-                appropriate_range = main_stat <= stat_range["max_stat"]
+                appropriate_range = (stat_range["min_stat"] * 0.75) <= main_stat <= (stat_range["max_stat"] * 1.2)
             if not appropriate_range:
                 continue
             if not stats["boss"] and not stats["miniboss"]:
@@ -4371,36 +5435,43 @@ class Adventure(BaseCog):
             choice = random.choice(possible_monsters)
         return choice
 
-    def _dynamic_monster_stats(self, ctx: Context, choice: MutableMapping):
+    def _dynamic_monster_stats(self, ctx: commands.Context, choice: MutableMapping):
         stat_range = self._adv_results.get_stat_range(ctx)
         win_percentage = stat_range.get("win_percent", 0.5)
+        choice["cdef"] = choice.get("cdef", 1.0)
         if win_percentage >= 0.90:
-            monster_hp_min = int(choice["hp"] * 1.45)
-            monster_hp_max = int(choice["hp"] * 1.5)
-            monster_diplo_min = int(choice["dipl"] * 1.45)
-            monster_diplo_max = int(choice["dipl"] * 1.5)
+            monster_hp_min = int(choice["hp"] * 2)
+            monster_hp_max = int(choice["hp"] * 3)
+            monster_diplo_min = int(choice["dipl"] * 2)
+            monster_diplo_max = int(choice["dipl"] * 3)
             percent_pdef = random.randrange(25, 30) / 100
             monster_pdef = choice["pdef"] * percent_pdef
             percent_mdef = random.randrange(25, 30) / 100
             monster_mdef = choice["mdef"] * percent_mdef
+            percent_cdef = random.randrange(25, 30) / 100
+            monster_cdef = choice["cdef"] * percent_cdef
         elif win_percentage >= 0.75:
-            monster_hp_min = int(choice["hp"] * 1.25)
-            monster_hp_max = int(choice["hp"] * 1.45)
-            monster_diplo_min = int(choice["dipl"] * 1.25)
-            monster_diplo_max = int(choice["dipl"] * 1.45)
+            monster_hp_min = int(choice["hp"] * 1.5)
+            monster_hp_max = int(choice["hp"] * 2)
+            monster_diplo_min = int(choice["dipl"] * 1.5)
+            monster_diplo_max = int(choice["dipl"] * 2)
             percent_pdef = random.randrange(15, 25) / 100
             monster_pdef = choice["pdef"] * percent_pdef
             percent_mdef = random.randrange(15, 25) / 100
             monster_mdef = choice["mdef"] * percent_mdef
+            percent_cdef = random.randrange(15, 25) / 100
+            monster_cdef = choice["cdef"] * percent_cdef
         elif win_percentage >= 0.50:
             monster_hp_min = int(choice["hp"])
-            monster_hp_max = int(choice["hp"] * 1.25)
+            monster_hp_max = int(choice["hp"] * 1.5)
             monster_diplo_min = int(choice["dipl"])
-            monster_diplo_max = int(choice["dipl"] * 1.25)
+            monster_diplo_max = int(choice["dipl"] * 1.5)
             percent_pdef = random.randrange(1, 15) / 100
             monster_pdef = choice["pdef"] * percent_pdef
             percent_mdef = random.randrange(1, 15) / 100
             monster_mdef = choice["mdef"] * percent_mdef
+            percent_cdef = random.randrange(1, 15) / 100
+            monster_cdef = choice["cdef"] * percent_cdef
         elif win_percentage >= 0.35:
             monster_hp_min = int(choice["hp"] * 0.9)
             monster_hp_max = int(choice["hp"])
@@ -4410,6 +5481,8 @@ class Adventure(BaseCog):
             monster_pdef = choice["pdef"] * percent_pdef * -1
             percent_mdef = random.randrange(1, 15) / 100
             monster_mdef = choice["mdef"] * percent_mdef * -1
+            percent_cdef = random.randrange(1, 15) / 100
+            monster_cdef = choice["cdef"] * percent_cdef * -1
         elif win_percentage >= 0.15:
             monster_hp_min = int(choice["hp"] * 0.8)
             monster_hp_max = int(choice["hp"] * 0.9)
@@ -4419,6 +5492,8 @@ class Adventure(BaseCog):
             monster_pdef = choice["pdef"] * percent_pdef * -1
             percent_mdef = random.randrange(15, 25) / 100
             monster_mdef = choice["mdef"] * percent_mdef * -1
+            percent_cdef = random.randrange(15, 25) / 100
+            monster_cdef = choice["cdef"] * percent_cdef * -1
         else:
             monster_hp_min = int(choice["hp"] * 0.6)
             monster_hp_max = int(choice["hp"] * 0.8)
@@ -4428,6 +5503,8 @@ class Adventure(BaseCog):
             monster_pdef = choice["pdef"] * percent_pdef * -1
             percent_mdef = random.randrange(25, 30) / 100
             monster_mdef = choice["mdef"] * percent_mdef * -1
+            percent_cdef = random.randrange(25, 30) / 100
+            monster_cdef = choice["cdef"] * percent_cdef * -1
 
         if monster_hp_min < monster_hp_max:
             new_hp = random.randrange(monster_hp_min, monster_hp_max)
@@ -4441,36 +5518,44 @@ class Adventure(BaseCog):
             new_diplo = random.randrange(monster_diplo_max, monster_diplo_min)
         else:
             new_diplo = max(monster_diplo_max, monster_diplo_min)
+
         new_pdef = choice["pdef"] + monster_pdef
         new_mdef = choice["mdef"] + monster_mdef
+        new_cdef = choice["cdef"] + monster_cdef
         choice["hp"] = new_hp
         choice["dipl"] = new_diplo
         choice["pdef"] = new_pdef
         choice["mdef"] = new_mdef
+        choice["cdef"] = new_cdef
         return choice
 
     async def update_monster_roster(self, user):
 
         try:
-            c = await Character.from_json(self.config, user)
+            c = await Character.from_json(self.config, user, self._daily_bonus)
         except Exception as exc:
             log.exception("Error with the new character sheet", exc_info=exc)
             return ({**self.MONSTERS, **self.AS_MONSTERS}, 1)
+
+        transcended_chance = random.randint(0, 10)
         theme = await self.config.theme()
         extra_monsters = await self.config.themes.all()
         extra_monsters = extra_monsters.get(theme, {}).get("monsters", {})
         monster_stats = 1
         monsters = {**self.MONSTERS, **self.AS_MONSTERS, **extra_monsters}
-        if c.rebirths >= 10:
+        transcended = False
+        if transcended_chance == 5:
+            monster_stats = 2 + max((c.rebirths // 10) - 1, 0)
+            transcended = True
+        elif c.rebirths >= 10:
             monster_stats = 1 + max((c.rebirths // 10) - 1, 0) / 2
-        return (monsters, monster_stats)
+        return monsters, monster_stats, transcended
 
-    async def _simple(
-        self, ctx: Context, adventure_msg, challenge: str = None, attribute: str = None
-    ):
+    async def _simple(self, ctx: commands.Context, adventure_msg, challenge: str = None, attribute: str = None):
         self.bot.dispatch("adventure", ctx)
         text = ""
-        monster_roster, monster_stats = await self.update_monster_roster(ctx.author)
+        easy_mode = await self.config.easy_mode()
+        monster_roster, monster_stats, transcended = await self.update_monster_roster(ctx.author)
         if not challenge or challenge not in monster_roster:
             challenge = await self.get_challenge(ctx, monster_roster)
 
@@ -4478,29 +5563,48 @@ class Adventure(BaseCog):
             attribute = attribute.lower()
         else:
             attribute = random.choice(list(self.ATTRIBS.keys()))
-
-        if monster_roster[challenge]["boss"]:
-            timer = 60 * 5
-            text = box(_("\n [{} Alarm!]").format(challenge), lang="css")
-            self.bot.dispatch("adventure_boss", ctx)  # dispatches an event on bosses
-        elif monster_roster[challenge]["miniboss"]:
-            timer = 60 * 3
-            self.bot.dispatch("adventure_miniboss", ctx)
+        if transcended:
+            new_challenge = challenge.replace("Ascended", "Transcended")
         else:
-            timer = 60 * 2
+            new_challenge = challenge
 
+        if easy_mode:
+            no_monster = False
+            if monster_roster[challenge]["boss"]:
+                timer = 60 * 5
+                self.bot.dispatch("adventure_boss", ctx)
+                text = box(_("\n [{} Alarm!]").format(new_challenge), lang="css")
+            elif monster_roster[challenge]["miniboss"]:
+                timer = 60 * 3
+                self.bot.dispatch("adventure_miniboss", ctx)
+            else:
+                timer = 60 * 2
+            if "Transcended" in new_challenge:
+                self.bot.dispatch("adventure_transcended", ctx)
+            elif "Ascended" in new_challenge:
+                self.bot.dispatch("adventure_ascended", ctx)
+            if attribute == "n immortal":
+                self.bot.dispatch("adventure_immortal", ctx)
+            elif attribute == " possessed":
+                self.bot.dispatch("adventure_possessed", ctx)
+        else:
+            timer = 60 * 3
+            no_monster = random.randint(0, 100) == 25
         self._sessions[ctx.guild.id] = GameSession(
-            challenge=challenge,
-            attribute=attribute,
+            challenge=new_challenge if not no_monster else None,
+            attribute=attribute if not no_monster else None,
             guild=ctx.guild,
-            boss=monster_roster[challenge]["boss"],
-            miniboss=monster_roster[challenge]["miniboss"],
+            boss=monster_roster[challenge]["boss"] if not no_monster else None,
+            miniboss=monster_roster[challenge]["miniboss"] if not no_monster else None,
             timer=timer,
-            monster=monster_roster[challenge],
-            monsters=monster_roster,
-            monster_stats=monster_stats,
+            monster=monster_roster[challenge] if not no_monster else None,
+            monsters=monster_roster if not no_monster else None,
+            monster_stats=monster_stats if not no_monster else None,
             message=ctx.message,
+            transcended=transcended if not no_monster else None,
             monster_modified_stats=self._dynamic_monster_stats(ctx, monster_roster[challenge]),
+            easy_mode=easy_mode,
+            no_monster=no_monster,
         )
         adventure_msg = (
             f"{adventure_msg}{text}\n{random.choice(self.LOCATIONS)}\n"
@@ -4513,110 +5617,137 @@ class Adventure(BaseCog):
         participants = self._sessions[ctx.guild.id].participants
         return (rewards, participants)
 
-    async def _choice(self, ctx: Context, adventure_msg):
+    async def _choice(self, ctx: commands.Context, adventure_msg):
         session = self._sessions[ctx.guild.id]
-        dragon_text = _(
-            "but **a{attr} {chall}** "
-            "just landed in front of you glaring! \n\n"
-            "What will you do and will other heroes be brave enough to help you?\n"
-            "Heroes have 5 minutes to participate via reaction:"
-            "\n\nReact with: {reactions}"
-        ).format(
-            attr=session.attribute,
-            chall=session.challenge,
-            reactions="**"
-            + _("Fight")
-            + "** - **"
-            + _("Spell")
-            + "** - **"
-            + _("Talk")
-            + "** - **"
-            + _("Pray")
-            + "** - **"
-            + _("Run")
-            + "**",
-        )
-        basilisk_text = _(
-            "but **a{attr} {chall}** stepped out looking around. \n\n"
-            "What will you do and will other heroes help your cause?\n"
-            "Heroes have 3 minutes to participate via reaction:"
-            "\n\nReact with: {reactions}"
-        ).format(
-            attr=session.attribute,
-            chall=session.challenge,
-            reactions="**"
-            + _("Fight")
-            + "** - **"
-            + _("Spell")
-            + "** - **"
-            + _("Talk")
-            + "** - **"
-            + _("Pray")
-            + "** - **"
-            + _("Run")
-            + "**",
-        )
-        normal_text = _(
-            "but **a{attr} {chall}** "
-            "is guarding it with{threat}. \n\n"
-            "What will you do and will other heroes help your cause?\n"
-            "Heroes have 2 minutes to participate via reaction:"
-            "\n\nReact with: {reactions}"
-        ).format(
-            attr=session.attribute,
-            chall=session.challenge,
-            threat=random.choice(self.THREATEE),
-            reactions="**"
-            + _("Fight")
-            + "** - **"
-            + _("Spell")
-            + "** - **"
-            + _("Talk")
-            + "** - **"
-            + _("Pray")
-            + "** - **"
-            + _("Run")
-            + "**",
-        )
+        easy_mode = session.easy_mode
+        if easy_mode:
+            dragon_text = _(
+                "but **a{attr} {chall}** "
+                "just landed in front of you glaring! \n\n"
+                "What will you do and will other heroes be brave enough to help you?\n"
+                "Heroes have 5 minutes to participate via reaction:"
+                "\n\nReact with: {reactions}"
+            ).format(
+                attr=session.attribute,
+                chall=session.challenge,
+                reactions="**"
+                + _("Fight")
+                + "** - **"
+                + _("Spell")
+                + "** - **"
+                + _("Talk")
+                + "** - **"
+                + _("Pray")
+                + "** - **"
+                + _("Run")
+                + "**",
+            )
+            basilisk_text = _(
+                "but **a{attr} {chall}** stepped out looking around. \n\n"
+                "What will you do and will other heroes help your cause?\n"
+                "Heroes have 3 minutes to participate via reaction:"
+                "\n\nReact with: {reactions}"
+            ).format(
+                attr=session.attribute,
+                chall=session.challenge,
+                reactions="**"
+                + _("Fight")
+                + "** - **"
+                + _("Spell")
+                + "** - **"
+                + _("Talk")
+                + "** - **"
+                + _("Pray")
+                + "** - **"
+                + _("Run")
+                + "**",
+            )
+            normal_text = _(
+                "but **a{attr} {chall}** "
+                "is guarding it with{threat}. \n\n"
+                "What will you do and will other heroes help your cause?\n"
+                "Heroes have 2 minutes to participate via reaction:"
+                "\n\nReact with: {reactions}"
+            ).format(
+                attr=session.attribute,
+                chall=session.challenge,
+                threat=random.choice(self.THREATEE),
+                reactions="**"
+                + _("Fight")
+                + "** - **"
+                + _("Spell")
+                + "** - **"
+                + _("Talk")
+                + "** - **"
+                + _("Pray")
+                + "** - **"
+                + _("Run")
+                + "**",
+            )
 
-        embed = discord.Embed(colour=discord.Colour.blurple())
-        use_embeds = (
-            await self.config.guild(ctx.guild).embed()
-            and ctx.channel.permissions_for(ctx.me).embed_links
-        )
-        if session.boss:
-            if use_embeds:
-                embed.description = f"{adventure_msg}\n{dragon_text}"
-                embed.colour = discord.Colour.dark_red()
-                if session.monster["image"]:
-                    embed.set_image(url=session.monster["image"])
-                adventure_msg = await ctx.send(embed=embed)
-            else:
-                adventure_msg = await ctx.send(f"{adventure_msg}\n{dragon_text}")
-            timeout = 60 * 5
+            embed = discord.Embed(colour=discord.Colour.blurple())
+            use_embeds = await self.config.guild(ctx.guild).embed() and ctx.channel.permissions_for(ctx.me).embed_links
+            if session.boss:
+                if use_embeds:
+                    embed.description = f"{adventure_msg}\n{dragon_text}"
+                    embed.colour = discord.Colour.dark_red()
+                    if session.monster["image"]:
+                        embed.set_image(url=session.monster["image"])
+                    adventure_msg = await ctx.send(embed=embed)
+                else:
+                    adventure_msg = await ctx.send(f"{adventure_msg}\n{dragon_text}")
+                timeout = 60 * 5
 
-        elif session.miniboss:
-            if use_embeds:
-                embed.description = f"{adventure_msg}\n{basilisk_text}"
-                embed.colour = discord.Colour.dark_green()
-                if session.monster["image"]:
-                    embed.set_image(url=session.monster["image"])
-                adventure_msg = await ctx.send(embed=embed)
+            elif session.miniboss:
+                if use_embeds:
+                    embed.description = f"{adventure_msg}\n{basilisk_text}"
+                    embed.colour = discord.Colour.dark_green()
+                    if session.monster["image"]:
+                        embed.set_image(url=session.monster["image"])
+                    adventure_msg = await ctx.send(embed=embed)
+                else:
+                    adventure_msg = await ctx.send(f"{adventure_msg}\n{basilisk_text}")
+                timeout = 60 * 3
             else:
-                adventure_msg = await ctx.send(f"{adventure_msg}\n{basilisk_text}")
-            timeout = 60 * 3
+                if use_embeds:
+                    embed.description = f"{adventure_msg}\n{normal_text}"
+                    if session.monster["image"]:
+                        embed.set_thumbnail(url=session.monster["image"])
+                    adventure_msg = await ctx.send(embed=embed)
+                else:
+                    adventure_msg = await ctx.send(f"{adventure_msg}\n{normal_text}")
+                timeout = 60 * 2
         else:
+            embed = discord.Embed(colour=discord.Colour.blurple())
+            use_embeds = await self.config.guild(ctx.guild).embed() and ctx.channel.permissions_for(ctx.me).embed_links
+            timeout = 60 * 3
+            obscured_text = _(
+                "What will you do and will other heroes help your cause?\n"
+                "Heroes have {time} minutes to participate via reaction:"
+                "\n\nReact with: {reactions}"
+            ).format(
+                reactions="**"
+                + _("Fight")
+                + "** - **"
+                + _("Spell")
+                + "** - **"
+                + _("Talk")
+                + "** - **"
+                + _("Pray")
+                + "** - **"
+                + _("Run")
+                + "**",
+                time=timeout // 60,
+            )
             if use_embeds:
-                embed.description = f"{adventure_msg}\n{normal_text}"
-                if session.monster["image"]:
-                    embed.set_thumbnail(url=session.monster["image"])
+                embed.description = f"{adventure_msg}\n{obscured_text}"
                 adventure_msg = await ctx.send(embed=embed)
             else:
-                adventure_msg = await ctx.send(f"{adventure_msg}\n{normal_text}")
-            timeout = 60 * 2
+                adventure_msg = await ctx.send(f"{adventure_msg}\n{obscured_text}")
+
         session.message_id = adventure_msg.id
         session.message = adventure_msg
-        start_adding_reactions(adventure_msg, self._adventure_actions, ctx.bot.loop)
+        start_adding_reactions(adventure_msg, self._adventure_actions)
         timer = await self._adv_countdown(ctx, session.timer, "Time remaining")
         self.tasks[adventure_msg.id] = timer
         try:
@@ -4670,25 +5801,30 @@ class Adventure(BaseCog):
         await self.bot.wait_until_ready()
         if user.bot:
             return
-        try:
-            guild = user.guild
-        except AttributeError:
-            return
         emojis = ReactionPredicate.NUMBER_EMOJIS + self._adventure_actions
         if str(reaction.emoji) not in emojis:
+            return
+        if (guild := getattr(user, "guild", None)) is not None:
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                return
+        else:
             return
         if not await self.has_perm(user):
             return
         if guild.id in self._sessions:
             if reaction.message.id == self._sessions[guild.id].message_id:
-                await self._handle_adventure(reaction, user)
+                if guild.id in self._adventure_countdown:
+                    (timer, done, sremain) = self._adventure_countdown[guild.id]
+                    if sremain > 3:
+                        await self._handle_adventure(reaction, user)
         if guild.id in self._current_traders:
-            if reaction.message.id == self._current_traders[guild.id][
-                "msg"
-            ] and not self.in_adventure(user=user):
+            if reaction.message.id == self._current_traders[guild.id]["msg"] and not self.in_adventure(user=user):
                 if user in self._current_traders[guild.id]["users"]:
                     return
-                await self._handle_cart(reaction, user)
+                if guild.id in self._trader_countdown:
+                    (timer, done, sremain) = self._trader_countdown[guild.id]
+                    if sremain > 3:
+                        await self._handle_cart(reaction, user)
 
     async def _handle_adventure(self, reaction, user):
         action = {v: k for k, v in self._adventure_controls.items()}[str(reaction.emoji)]
@@ -4699,7 +5835,7 @@ class Adventure(BaseCog):
                 getattr(session, x).remove(user)
 
             if not has_fund or user in getattr(session, x, []):
-                with contextlib.suppress(discord.HTTPException):
+                if reaction.message.channel.permissions_for(user.guild.me).manage_messages:
                     symbol = self._adventure_controls[x]
                     await reaction.message.remove_reaction(symbol, user)
 
@@ -4743,7 +5879,6 @@ class Adventure(BaseCog):
                             ).format(c=self.escape(user.display_name))
                         )
                         self._react_messaged.append(user_id)
-                        return
                 else:
                     getattr(session, action).append(user)
             else:
@@ -4757,16 +5892,12 @@ class Adventure(BaseCog):
         self._current_traders[guild.id]["users"].append(user)
         spender = user
         channel = reaction.message.channel
-        currency_name = await bank.get_currency_name(guild)
+        currency_name = await bank.get_currency_name(guild,)
         if currency_name.startswith("<"):
             currency_name = "credits"
-        item_data = box(
-            items["item"].formatted_name + " - " + humanize_number(items["price"]), lang="css"
-        )
+        item_data = box(items["item"].formatted_name + " - " + humanize_number(items["price"]), lang="css")
         to_delete = await channel.send(
-            _("{user}, how many {item} would you like to buy?").format(
-                user=user.mention, item=item_data
-            )
+            _("{user}, how many {item} would you like to buy?").format(user=user.mention, item=item_data)
         )
         ctx = await self.bot.get_context(reaction.message)
         ctx.author = user
@@ -4787,9 +5918,19 @@ class Adventure(BaseCog):
             await bank.withdraw_credits(spender, int(items["price"]) * pred.result)
             async with self.get_lock(user):
                 try:
-                    c = await Character.from_json(self.config, user)
+                    c = await Character.from_json(self.config, user, self._daily_bonus)
                 except Exception as exc:
                     log.exception("Error with the new character sheet", exc_info=exc)
+                    return
+                if c.is_backpack_full(is_dev=self.is_dev(user)):
+                    with contextlib.suppress(discord.HTTPException):
+                        await to_delete.delete()
+                        await msg.delete()
+                    await channel.send(
+                        _("**{author}**, Your backpack is currently full.").format(
+                            author=self.escape(user.display_name)
+                        )
+                    )
                     return
                 item = items["item"]
                 item.owned = pred.result
@@ -4825,7 +5966,7 @@ class Adventure(BaseCog):
             )
             self._current_traders[guild.id]["users"].remove(user)
 
-    async def _result(self, ctx: Context, message: discord.Message):
+    async def _result(self, ctx: commands.Context, message: discord.Message):
         if ctx.guild.id not in self._sessions:
             return
         calc_msg = await ctx.send(_("Calculating..."))
@@ -4836,10 +5977,10 @@ class Adventure(BaseCog):
         critlist: list = []
         failed = False
         lost = False
-        session = self._sessions[ctx.guild.id]
         with contextlib.suppress(discord.HTTPException):
             await message.clear_reactions()
-
+        session = self._sessions[ctx.guild.id]
+        challenge = session.challenge
         fight_list = list(set(session.fight))
         talk_list = list(set(session.talk))
         pray_list = list(set(session.pray))
@@ -4851,70 +5992,6 @@ class Adventure(BaseCog):
         self._sessions[ctx.guild.id].pray = pray_list
         self._sessions[ctx.guild.id].run = run_list
         self._sessions[ctx.guild.id].magic = magic_list
-
-        people = (
-            len(fight_list) + len(magic_list) + len(talk_list) + len(pray_list) + len(run_list)
-        )
-
-        challenge = session.challenge
-
-        attack, diplomacy, magic, run_msg = await self.handle_run(
-            ctx.guild.id, attack, diplomacy, magic
-        )
-        failed = await self.handle_basilisk(ctx, failed)
-        fumblelist, attack, diplomacy, magic, pray_msg = await self.handle_pray(
-            ctx.guild.id, fumblelist, attack, diplomacy, magic
-        )
-        fumblelist, critlist, diplomacy, talk_msg = await self.handle_talk(
-            ctx.guild.id, fumblelist, critlist, diplomacy
-        )
-
-        # need to pass challenge because we need to query MONSTERS[challenge]["pdef"] (and mdef)
-        fumblelist, critlist, attack, magic, fight_msg = await self.handle_fight(
-            ctx.guild.id, fumblelist, critlist, attack, magic, challenge
-        )
-
-        result_msg = run_msg + pray_msg + talk_msg + fight_msg
-        challenge_attrib = session.attribute
-        hp = (
-            session.monster_modified_stats["hp"]
-            * self.ATTRIBS[challenge_attrib][0]
-            * session.monster_stats
-        )
-        dipl = (
-            session.monster_modified_stats["dipl"]
-            * self.ATTRIBS[challenge_attrib][1]
-            * session.monster_stats
-        )
-
-        dmg_dealt = attack + magic
-        slain = dmg_dealt >= round(hp)
-        persuaded = diplomacy >= round(dipl)
-        damage_str = ""
-        diplo_str = ""
-        if dmg_dealt > 0:
-            damage_str = _("The group {status} {challenge} **({result}/{int_hp})**.\n").format(
-                status=_("hit the") if failed or not slain else _("killed the"),
-                challenge=challenge,
-                result=humanize_number(dmg_dealt),
-                int_hp=humanize_number(int(hp)),
-            )
-        if diplomacy > 0:
-            diplo_str = _(
-                "The group {status} the {challenge} with {how}" " **({diplomacy}/{int_dipl})**.\n"
-            ).format(
-                status=_("tried to persuade") if not persuaded else _("distracted"),
-                challenge=challenge,
-                how=_("flattery") if failed or not persuaded else _("insults"),
-                diplomacy=humanize_number(diplomacy),
-                int_dipl=humanize_number(int(dipl)),
-            )
-        if dmg_dealt >= diplomacy:
-            self._adv_results.add_result(ctx, "attack", dmg_dealt, people, slain)
-        else:
-            self._adv_results.add_result(ctx, "talk", diplomacy, people, persuaded)
-        result_msg = result_msg + "\n" + damage_str + diplo_str
-
         fight_name_list = []
         wizard_name_list = []
         talk_name_list = []
@@ -4930,89 +6007,188 @@ class Adventure(BaseCog):
             pray_name_list.append(f"**{self.escape(user.display_name)}**")
 
         fighters_final_string = _(" and ").join(
-            [", ".join(fight_name_list[:-1]), fight_name_list[-1]]
-            if len(fight_name_list) > 2
-            else fight_name_list
+            [", ".join(fight_name_list[:-1]), fight_name_list[-1]] if len(fight_name_list) > 2 else fight_name_list
         )
         wizards_final_string = _(" and ").join(
-            [", ".join(wizard_name_list[:-1]), wizard_name_list[-1]]
-            if len(wizard_name_list) > 2
-            else wizard_name_list
+            [", ".join(wizard_name_list[:-1]), wizard_name_list[-1]] if len(wizard_name_list) > 2 else wizard_name_list
         )
         talkers_final_string = _(" and ").join(
-            [", ".join(talk_name_list[:-1]), talk_name_list[-1]]
-            if len(talk_name_list) > 2
-            else talk_name_list
+            [", ".join(talk_name_list[:-1]), talk_name_list[-1]] if len(talk_name_list) > 2 else talk_name_list
         )
         preachermen_final_string = _(" and ").join(
-            [", ".join(pray_name_list[:-1]), pray_name_list[-1]]
-            if len(pray_name_list) > 2
-            else pray_name_list
+            [", ".join(pray_name_list[:-1]), pray_name_list[-1]] if len(pray_name_list) > 2 else pray_name_list
         )
+        if session.no_monster:
+            avaliable_loot = [
+                [0, 0, 1, 5, 2, 1],
+                [0, 0, 0, 0, 1, 2],
+                [0, 0, 1, 5, 1, 1],
+                [0, 0, 1, 3, 0, 1],
+                [0, 0, 1, 1, 1, 1],
+                [0, 0, 0, 0, 0, 1],
+                [0, 0, 3, 1, 0, 0],
+                [0, 0, 1, 2, 1, 0],
+                [0, 0, 0, 3, 2, 0],
+            ]
+            treasure = random.choice(avaliable_loot)
+
+            session.participants = set(fight_list + magic_list + talk_list + pray_list + run_list + fumblelist)
+
+            participants = {
+                "fight": fight_list,
+                "spell": magic_list,
+                "talk": talk_list,
+                "pray": pray_list,
+                "run": run_list,
+                "fumbles": fumblelist,
+            }
+            text = ""
+            text += await self._reward(
+                ctx,
+                [u for u in fight_list + magic_list + pray_list + talk_list if u not in fumblelist],
+                500 + int(500 * (0.25 * len(session.participants))),
+                0,
+                treasure,
+            )
+            parsed_users = []
+            for (action_name, action) in participants.items():
+                for user in action:
+                    try:
+                        c = await Character.from_json(self.config, user, self._daily_bonus)
+                    except Exception as exc:
+                        log.exception("Error with the new character sheet", exc_info=exc)
+                        continue
+                    current_val = c.adventures.get(action_name, 0)
+                    c.adventures.update({action_name: current_val + 1})
+                    if user not in parsed_users:
+                        special_action = "loses" if lost or user in participants["run"] else "wins"
+                        current_val = c.adventures.get(special_action, 0)
+                        c.adventures.update({special_action: current_val + 1})
+                        c.weekly_score.update({"adventures": c.weekly_score.get("adventures", 0) + 1})
+                        parsed_users.append(user)
+                    await self.config.user(user).set(await c.to_json(self.config))
+            attack, diplomacy, magic, run_msg = await self.handle_run(
+                ctx.guild.id, attack, diplomacy, magic, shame=True
+            )
+
+            output = _(
+                "All adventures prepared for an epic adventure, but they soon realise all this treasure was unprotected!\nIt's a shame for the following adventurers\n{run_msg}\n{text}"
+            ).format(text=text, run_msg=run_msg,)
+            output = pagify(output, page_length=1900)
+            await calc_msg.delete()
+            for i in output:
+                await smart_embed(ctx, i, success=True)
+            return
+
+        people = len(fight_list) + len(magic_list) + len(talk_list) + len(pray_list) + len(run_list)
+        attack, diplomacy, magic, run_msg = await self.handle_run(ctx.guild.id, attack, diplomacy, magic)
+        failed = await self.handle_basilisk(ctx)
+        fumblelist, attack, diplomacy, magic, pray_msg = await self.handle_pray(
+            ctx.guild.id, fumblelist, attack, diplomacy, magic
+        )
+        fumblelist, critlist, diplomacy, talk_msg = await self.handle_talk(
+            ctx.guild.id, fumblelist, critlist, diplomacy
+        )
+        fumblelist, critlist, attack, magic, fight_msg = await self.handle_fight(
+            ctx.guild.id, fumblelist, critlist, attack, magic
+        )
+        result_msg = run_msg + pray_msg + talk_msg + fight_msg
+        challenge_attrib = session.attribute
+        hp = int(session.monster_modified_stats["hp"] * self.ATTRIBS[challenge_attrib][0] * session.monster_stats)
+        dipl = int(session.monster_modified_stats["dipl"] * self.ATTRIBS[challenge_attrib][1] * session.monster_stats)
+
+        dmg_dealt = int(attack + magic)
+        diplomacy = int(diplomacy)
+        slain = dmg_dealt >= int(hp)
+        persuaded = diplomacy >= int(dipl)
+        damage_str = ""
+        diplo_str = ""
+        if dmg_dealt > 0:
+            damage_str = _("The group {status} **{challenge}** **({result}/{int_hp})**.\n").format(
+                status=_("hit the") if failed or not slain else _("killed the"),
+                challenge=challenge,
+                result=humanize_number(dmg_dealt),
+                int_hp=humanize_number(hp),
+            )
+        if diplomacy > 0:
+            diplo_str = _("The group {status} the **{challenge}** with {how} **({diplomacy}/{int_dipl})**.\n").format(
+                status=_("tried to persuade") if not persuaded else _("distracted"),
+                challenge=challenge,
+                how=_("flattery") if failed or not persuaded else _("insults"),
+                diplomacy=humanize_number(diplomacy),
+                int_dipl=humanize_number(dipl),
+            )
+        if dmg_dealt >= diplomacy:
+            self._adv_results.add_result(ctx, "attack", dmg_dealt, people, slain)
+        else:
+            self._adv_results.add_result(ctx, "talk", diplomacy, people, persuaded)
+        result_msg = result_msg + "\n" + damage_str + diplo_str
+
         await calc_msg.delete()
         text = ""
         success = False
-        treasure = [0, 0, 0, 0, 0]
-        if slain or persuaded and not failed:
+        treasure = [0, 0, 0, 0, 0, 0]
+        if (slain or persuaded) and not failed:
             success = True
             roll = random.randint(1, 10)
             monster_amount = hp + dipl if slain and persuaded else hp if slain else dipl
-            if session.boss:  # rewards 60:30:10 Epic Legendary Gear Set items
-                avaliable_loot = [[0, 0, 3, 1, 0], [0, 0, 1, 2, 0], [0, 0, 0, 3, 0]]
-                if "ascended" in session.challenge.lower():
+            if session.transcended:
+                if session.boss and "Trancended" in session.challenge:
                     avaliable_loot = [
-                        [0, 0, 1, 5, 1],
-                        [0, 0, 1, 3, 1],
-                        [0, 0, 1, 1, 1],
-                        [0, 0, 0, 0, 1],
+                        [0, 0, 1, 5, 2, 1],
+                        [0, 0, 0, 0, 1, 2],
+                    ]
+                else:
+                    avaliable_loot = [
+                        [0, 0, 1, 5, 1, 1],
+                        [0, 0, 1, 3, 0, 1],
+                        [0, 0, 1, 1, 1, 1],
+                        [0, 0, 0, 0, 0, 1],
                     ]
                 treasure = random.choice(avaliable_loot)
-            elif (
-                session.miniboss
-            ):  # rewards 50:50 rare:normal chest for killing something like the basilisk
+            elif session.boss:  # rewards 60:30:10 Epic Legendary Gear Set items
+                avaliable_loot = [[0, 0, 3, 1, 0, 0], [0, 0, 1, 2, 1, 0], [0, 0, 0, 3, 2, 0]]
+                treasure = random.choice(avaliable_loot)
+            elif session.miniboss:  # rewards 50:50 rare:normal chest for killing something like the basilisk
                 treasure = random.choice(
-                    [[1, 1, 1, 0, 0], [0, 0, 1, 1, 0], [0, 0, 2, 2, 0], [0, 1, 0, 2, 0]]
+                    [[1, 1, 1, 0, 0, 0], [0, 0, 1, 1, 1, 0], [0, 0, 2, 2, 0, 0], [0, 1, 0, 2, 1, 0]]
                 )
             elif monster_amount >= 700:  # super hard stuff
                 if roll <= 7:
-                    treasure = random.choice([[0, 0, 1, 0, 0], [0, 1, 0, 0, 0], [0, 0, 0, 1, 0]])
+                    treasure = random.choice([[0, 0, 1, 0, 0, 0], [0, 1, 0, 0, 0, 0], [0, 0, 0, 1, 1, 0]])
             elif monster_amount >= 500:  # rewards 50:50 rare:epic chest for killing hard stuff.
                 if roll <= 5:
-                    treasure = random.choice([[0, 0, 1, 0, 0], [0, 1, 0, 0, 0], [0, 1, 1, 0, 0]])
-            elif (
-                monster_amount >= 300
-            ):  # rewards 50:50 rare:normal chest for killing hardish stuff
+                    treasure = random.choice([[0, 0, 1, 0, 0, 0], [0, 1, 0, 0, 0, 0], [0, 1, 1, 0, 0, 0]])
+            elif monster_amount >= 300:  # rewards 50:50 rare:normal chest for killing hardish stuff
                 if roll <= 2:
-                    treasure = random.choice([[1, 0, 0, 0, 0], [0, 1, 0, 0, 0], [1, 1, 0, 0, 0]])
-            elif (
-                monster_amount >= 80
-            ):  # small chance of a normal chest on killing stuff that's not terribly weak
+                    treasure = random.choice([[1, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0], [1, 1, 0, 0, 0, 0]])
+            elif monster_amount >= 80:  # small chance of a normal chest on killing stuff that's not terribly weak
                 if roll == 1:
-                    treasure = [1, 0, 0, 0, 0]
+                    treasure = [1, 0, 0, 0, 0, 0]
 
             if session.boss:  # always rewards at least an epic chest.
                 # roll for legendary chest
                 roll = random.randint(1, 100)
-                if roll <= 20:
+                if roll <= 10:
+                    treasure[4] += 1
+                elif roll <= 20:
                     treasure[3] += 1
                 else:
                     treasure[2] += 1
             if len(critlist) != 0:
                 treasure[0] += 1
-            if treasure == [0, 0, 0, 0, 0]:
+            if treasure == [0, 0, 0, 0, 0, 0]:
                 treasure = False
         if session.miniboss and failed:
-            session.participants = set(
-                fight_list + talk_list + pray_list + magic_list + fumblelist
-            )
-            currency_name = await bank.get_currency_name(ctx.guild)
+            session.participants = set(fight_list + talk_list + pray_list + magic_list + fumblelist)
+            currency_name = await bank.get_currency_name(ctx.guild,)
             for user in session.participants:
                 try:
-                    c = await Character.from_json(self.config, user)
+                    c = await Character.from_json(self.config, user, self._daily_bonus)
                 except Exception as exc:
                     log.exception("Error with the new character sheet", exc_info=exc)
                     continue
-                multiplier = 0.1
+                multiplier = 0.2 if c.rebirths >= 5 else 0.01
                 if c.dex != 0:
                     if c.dex < 0:
                         dex = min(1 / abs(c.dex), 1)
@@ -5048,23 +6224,21 @@ class Adventure(BaseCog):
                             )
                         )
                         temp_repair.append(user)
-                result_msg += _(
-                    "\n{loss_list} to repay a passing cleric that unfroze the group."
-                ).format(loss_list=humanize_list(loss_list))
+                result_msg += _("\n{loss_list} to repay a passing cleric that unfroze the group.").format(
+                    loss_list=humanize_list(loss_list)
+                )
             return await smart_embed(ctx, result_msg)
         if session.miniboss and not slain and not persuaded:
             lost = True
-            session.participants = set(
-                fight_list + talk_list + pray_list + magic_list + fumblelist
-            )
-            currency_name = await bank.get_currency_name(ctx.guild)
+            session.participants = set(fight_list + talk_list + pray_list + magic_list + fumblelist)
+            currency_name = await bank.get_currency_name(ctx.guild,)
             for user in session.participants:
                 try:
-                    c = await Character.from_json(self.config, user)
+                    c = await Character.from_json(self.config, user, self._daily_bonus)
                 except Exception as exc:
                     log.exception("Error with the new character sheet", exc_info=exc)
                     continue
-                multiplier = 0.1
+                multiplier = 0.2 if c.rebirths >= 5 else 0.01
                 if c.dex != 0:
                     if c.dex < 0:
                         dex = min(1 / abs(c.dex), 1)
@@ -5095,7 +6269,7 @@ class Adventure(BaseCog):
             miniboss = session.challenge
             special = session.miniboss["special"]
             result_msg += _(
-                "The {miniboss}'s "
+                "The **{miniboss}'s** "
                 "{special} was countered, but he still managed to kill you."
                 "\n{loss_l} to repay a passing "
                 "cleric that resurrected the group."
@@ -5118,9 +6292,9 @@ class Adventure(BaseCog):
                 )
 
             if persuaded:
-                text = _(
-                    "{b_talkers} almost died in battle, but confounded the {chall} in the last second."
-                ).format(b_talkers=talkers_final_string, chall=session.challenge)
+                text = _("{b_talkers} almost died in battle, but confounded the {chall} in the last second.").format(
+                    b_talkers=talkers_final_string, chall=session.challenge
+                )
                 text += await self._reward(
                     ctx,
                     [u for u in talk_list + pray_list if u not in fumblelist],
@@ -5131,15 +6305,15 @@ class Adventure(BaseCog):
 
             if not slain and not persuaded:
                 lost = True
-                currency_name = await bank.get_currency_name(ctx.guild)
+                currency_name = await bank.get_currency_name(ctx.guild,)
                 users = set(fight_list + magic_list + talk_list + pray_list + fumblelist)
                 for user in users:
                     try:
-                        c = await Character.from_json(self.config, user)
+                        c = await Character.from_json(self.config, user, self._daily_bonus)
                     except Exception as exc:
                         log.exception("Error with the new character sheet", exc_info=exc)
                         continue
-                    multiplier = 0.1
+                    multiplier = 0.2 if c.rebirths >= 5 else 0.01
                     if c.dex != 0:
                         if c.dex < 0:
                             dex = min(1 / abs(c.dex), 1)
@@ -5167,19 +6341,11 @@ class Adventure(BaseCog):
                                 f"**{self.escape(user.display_name)}** used {humanize_number(loss)} {currency_name}"
                             )
                             temp_repair.append(user)
-                repair_text = (
-                    ""
-                    if not loss_list
-                    else f"{humanize_list(loss_list)} " + _("to repair their gear.")
-                )
+                repair_text = "" if not loss_list else f"{humanize_list(loss_list)} " + _("to repair their gear.")
                 options = [
-                    _("No amount of diplomacy or valiant fighting could save you.\n{}").format(
-                        repair_text
-                    ),
+                    _("No amount of diplomacy or valiant fighting could save you.\n{}").format(repair_text),
                     _("This challenge was too much for one hero.\n{}").format(repair_text),
-                    _(
-                        "You tried your best, but the group couldn't succeed at their attempt.\n{}"
-                    ).format(repair_text),
+                    _("You tried your best, but the group couldn't succeed at their attempt.\n{}").format(repair_text),
                 ]
                 text = random.choice(options)
         else:
@@ -5203,9 +6369,7 @@ class Adventure(BaseCog):
                             god=god,
                         )
                     else:
-                        group = (
-                            fighters_final_string if len(fight_list) > 0 else wizards_final_string
-                        )
+                        group = fighters_final_string if len(fight_list) > 0 else wizards_final_string
                         text = _(
                             "{b_group} slayed the {chall} "
                             "in battle, while {b_talkers} distracted with flattery and "
@@ -5230,22 +6394,13 @@ class Adventure(BaseCog):
                             b_wizard=wizards_final_string,
                         )
                     else:
-                        group = (
-                            fighters_final_string if len(fight_list) > 0 else wizards_final_string
-                        )
+                        group = fighters_final_string if len(fight_list) > 0 else wizards_final_string
                         text = _(
-                            "{b_group} slayed the {chall} "
-                            "in battle, while {b_talkers} distracted with insults."
-                        ).format(
-                            b_group=group, chall=session.challenge, b_talkers=talkers_final_string
-                        )
+                            "{b_group} slayed the {chall} in battle, while {b_talkers} distracted with insults."
+                        ).format(b_group=group, chall=session.challenge, b_talkers=talkers_final_string)
                 text += await self._reward(
                     ctx,
-                    [
-                        u
-                        for u in fight_list + magic_list + pray_list + talk_list
-                        if u not in fumblelist
-                    ],
+                    [u for u in fight_list + magic_list + pray_list + talk_list if u not in fumblelist],
                     amount,
                     round(((dmg_dealt / hp) + (diplomacy / dipl)) * 0.25),
                     treasure,
@@ -5253,12 +6408,8 @@ class Adventure(BaseCog):
 
             if not slain and persuaded:
                 if len(pray_list) > 0:
-                    text = _(
-                        "{b_talkers} talked the {chall} " "down with {b_preachers}'s blessing."
-                    ).format(
-                        b_talkers=talkers_final_string,
-                        chall=session.challenge,
-                        b_preachers=preachermen_final_string,
+                    text = _("{b_talkers} talked the {chall} down with {b_preachers}'s blessing.").format(
+                        b_talkers=talkers_final_string, chall=session.challenge, b_preachers=preachermen_final_string,
                     )
                 else:
                     text = _("{b_talkers} talked the {chall} down.").format(
@@ -5286,31 +6437,21 @@ class Adventure(BaseCog):
                             b_wizard=wizards_final_string,
                         )
                     else:
-                        group = (
-                            fighters_final_string if len(fight_list) > 0 else wizards_final_string
-                        )
+                        group = fighters_final_string if len(fight_list) > 0 else wizards_final_string
                         text = _(
                             "{b_group} killed the {chall} "
                             "in a most heroic battle with a little help from {b_preachers}."
-                        ).format(
-                            b_group=group,
-                            chall=session.challenge,
-                            b_preachers=preachermen_final_string,
-                        )
+                        ).format(b_group=group, chall=session.challenge, b_preachers=preachermen_final_string,)
                 else:
                     if len(magic_list) > 0 and len(fight_list) > 0:
                         text = _(
                             "{b_fighters} killed the {chall} "
                             "in a most heroic battle with {b_wizard} chanting magical incantations."
                         ).format(
-                            b_fighters=fighters_final_string,
-                            chall=session.challenge,
-                            b_wizard=wizards_final_string,
+                            b_fighters=fighters_final_string, chall=session.challenge, b_wizard=wizards_final_string,
                         )
                     else:
-                        group = (
-                            fighters_final_string if len(fight_list) > 0 else wizards_final_string
-                        )
+                        group = fighters_final_string if len(fight_list) > 0 else wizards_final_string
                         text = _("{b_group} killed the {chall} in an epic fight.").format(
                             b_group=group, chall=session.challenge
                         )
@@ -5324,15 +6465,15 @@ class Adventure(BaseCog):
 
             if not slain and not persuaded:
                 lost = True
-                currency_name = await bank.get_currency_name(ctx.guild)
+                currency_name = await bank.get_currency_name(ctx.guild,)
                 users = set(fight_list + magic_list + talk_list + pray_list + fumblelist)
                 for user in users:
                     try:
-                        c = await Character.from_json(self.config, user)
+                        c = await Character.from_json(self.config, user, self._daily_bonus)
                     except Exception as exc:
                         log.exception("Error with the new character sheet", exc_info=exc)
                         continue
-                    multiplier = 0.1
+                    multiplier = 0.2 if c.rebirths >= 5 else 0.01
                     if c.dex != 0:
                         if c.dex < 0:
                             dex = min(1 / abs(c.dex), 1)
@@ -5355,11 +6496,11 @@ class Adventure(BaseCog):
                     users = run_list
                     for user in users:
                         try:
-                            c = await Character.from_json(self.config, user)
+                            c = await Character.from_json(self.config, user, self._daily_bonus)
                         except Exception as exc:
                             log.exception("Error with the new character sheet", exc_info=exc)
                             continue
-                        multiplier = 0.05
+                        multiplier = 0.2
                         if c.dex != 0:
                             if c.dex < 0:
                                 dex = min(1 / abs(c.dex), 1)
@@ -5392,15 +6533,9 @@ class Adventure(BaseCog):
                                 )
                             )
                             temp_repair.append(user)
-                repair_text = (
-                    ""
-                    if not loss_list
-                    else _("{} to repair their gear.").format(humanize_list(loss_list))
-                )
+                repair_text = "" if not loss_list else _("{} to repair their gear.").format(humanize_list(loss_list))
                 options = [
-                    _("No amount of diplomacy or valiant fighting could save you.\n{}").format(
-                        repair_text
-                    ),
+                    _("No amount of diplomacy or valiant fighting could save you.\n{}").format(repair_text),
                     _("This challenge was too much for the group.\n{}").format(repair_text),
                     _("You tried your best, but couldn't succeed.\n{}").format(repair_text),
                 ]
@@ -5408,12 +6543,13 @@ class Adventure(BaseCog):
 
         output = f"{result_msg}\n{text}"
         output = pagify(output, page_length=1900)
+        img_sent = session.monster["image"] if not session.easy_mode else None
         for i in output:
-            await smart_embed(ctx, i, success=success)
+            await smart_embed(ctx, i, success=success, image=img_sent)
+            if img_sent:
+                img_sent = None
         await self._data_check(ctx)
-        session.participants = set(
-            fight_list + magic_list + talk_list + pray_list + run_list + fumblelist
-        )
+        session.participants = set(fight_list + magic_list + talk_list + pray_list + run_list + fumblelist)
 
         participants = {
             "fight": fight_list,
@@ -5428,7 +6564,7 @@ class Adventure(BaseCog):
         for (action_name, action) in participants.items():
             for user in action:
                 try:
-                    c = await Character.from_json(self.config, user)
+                    c = await Character.from_json(self.config, user, self._daily_bonus)
                 except Exception as exc:
                     log.exception("Error with the new character sheet", exc_info=exc)
                     continue
@@ -5442,7 +6578,7 @@ class Adventure(BaseCog):
                     parsed_users.append(user)
                 await self.config.user(user).set(await c.to_json(self.config))
 
-    async def handle_run(self, guild_id, attack, diplomacy, magic):
+    async def handle_run(self, guild_id, attack, diplomacy, magic, shame=False):
         runners = []
         msg = ""
         session = self._sessions[guild_id]
@@ -5450,9 +6586,13 @@ class Adventure(BaseCog):
             for user in session.run:
                 runners.append(f"**{self.escape(user.display_name)}**")
             msg += _("{} just ran away.\n").format(humanize_list(runners))
+            if shame:
+                msg += _(
+                    "They are now regretting their pathetic display of courage as their friends enjoy all their new loot.\n"
+                )
         return (attack, diplomacy, magic, msg)
 
-    async def handle_fight(self, guild_id, fumblelist, critlist, attack, magic, challenge):
+    async def handle_fight(self, guild_id, fumblelist, critlist, attack, magic):
         session = self._sessions[guild_id]
         fight_list = list(set(session.fight))
         magic_list = list(set(session.magic))
@@ -5465,47 +6605,19 @@ class Adventure(BaseCog):
         failed_emoji = self.emojis.fumble
         if len(attack_list) >= 1:
             msg = ""
-            if len(fight_list) >= 1:
-                # TODO: Remove me when psychic gets added
-                if pdef >= 1.5:
-                    msg += _(
-                        "Swords bounce off this monster as it's skin is **almost impenetrable!**\n"
-                    )
-                elif pdef >= 1.25:
-                    msg += _("This monster has **extremely tough** armour!\n")
-                elif pdef > 1:
-                    msg += _("Swords don't cut this monster **quite as well!**\n")
-                elif 0.75 <= pdef < 1:
-                    msg += _("This monster is **soft and easy** to slice!\n")
-                elif pdef > 0 and pdef != 1:
-                    msg += _(
-                        "Swords slice through this monster like a **hot knife through butter!**\n"
-                    )
-            if len(magic_list) >= 1:
-                if mdef >= 1.5:
-                    msg += _("Magic? Pfft, your puny magic is **no match** for this creature!\n")
-                elif mdef >= 1.25:
-                    msg += _("This monster has **substantial magic resistance!**\n")
-                elif mdef > 1:
-                    msg += _("This monster has increased **magic resistance!**\n")
-                elif 0.75 <= mdef < 1:
-                    msg += _("This monster's hide **melts to magic!**\n")
-                elif mdef > 0 and mdef != 1:
-                    msg += _("Magic spells are **hugely effective** against this monster!\n")
-
             report = _("Attack Party: \n\n")
         else:
             return (fumblelist, critlist, attack, magic, "")
 
         for user in fight_list:
             try:
-                c = await Character.from_json(self.config, user)
+                c = await Character.from_json(self.config, user, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 continue
-            crit_mod = max(c.dex, c.luck) + (c.total_att // 20)  # Thanks GoaFan77
+            crit_mod = max(max(c.dex, c.luck) + (c.total_att // 20), 1)  # Thanks GoaFan77
             mod = 0
-            max_roll = 50 if c.rebirths >= 15 else 20
+            max_roll = 100 if c.rebirths >= 30 else 50 if c.rebirths >= 15 else 20
             if crit_mod != 0:
                 mod = round(crit_mod / 10)
             if c.rebirths < 15 < mod:
@@ -5514,7 +6626,7 @@ class Adventure(BaseCog):
             elif (mod + 1) > 45:
                 mod = 45
 
-            roll = random.randint((1 + mod), max_roll)
+            roll = max(random.randint((1 + mod), max_roll), 1)
             if c.heroclass.get("pet", {}).get("bonuses", {}).get("crit", False):
                 pet_crit = c.heroclass.get("pet", {}).get("bonuses", {}).get("crit", 0)
                 pet_crit = random.randint(pet_crit, 100)
@@ -5524,10 +6636,10 @@ class Adventure(BaseCog):
                     roll = random.randint(max_roll - 5, max_roll)
                 elif roll > 25 and pet_crit >= 95:
                     roll = random.randint(roll, max_roll)
-
+            roll_perc = roll / max_roll
             att_value = c.total_att
-            rebirths = c.rebirths * 3 if c.heroclass["name"] == "Berserker" else 0
-            if roll == 1:
+            rebirths = c.rebirths * (3 if c.heroclass["name"] == "Berserker" else 1)
+            if roll_perc < 0.10:
                 if c.heroclass["name"] == "Berserker" and c.heroclass["ability"]:
                     bonus_roll = random.randint(5, 15)
                     bonus_multi = random.choice([0.2, 0.3, 0.4, 0.5])
@@ -5535,44 +6647,52 @@ class Adventure(BaseCog):
                     attack += int((roll - bonus + att_value) / pdef)
                     report += (
                         f"**{self.escape(user.display_name)}**: "
-                        f"{self.emojis.dice}({roll}) + {self.emojis.berserk}{humanize_number(bonus)} + {self.emojis.attack}{str(humanize_number(att_value))}\n"
+                        f"{self.emojis.dice}({roll}) + "
+                        f"{self.emojis.berserk}{humanize_number(bonus)} + "
+                        f"{self.emojis.attack}{str(humanize_number(att_value))}\n"
                     )
                 else:
                     msg += _("**{}** fumbled the attack.\n").format(self.escape(user.display_name))
                     fumblelist.append(user)
                     fumble_count += 1
-            elif roll == max_roll or c.heroclass["name"] == "Berserker":
+            elif roll_perc > 0.95 or c.heroclass["name"] == "Berserker":
                 crit_str = ""
                 crit_bonus = 0
                 base_bonus = random.randint(5, 10) + rebirths
-                if roll == max_roll:
-                    msg += _("**{}** landed a critical hit.\n").format(
-                        self.escape(user.display_name)
-                    )
+                if roll_perc > 0.95:
+                    msg += _("**{}** landed a critical hit.\n").format(self.escape(user.display_name))
                     critlist.append(user)
-                    crit_bonus = random.randint(5, 20) + 2 * rebirths
+                    crit_bonus = (random.randint(5, 20)) + (rebirths * 2)
                     crit_str = f"{self.emojis.crit} {humanize_number(crit_bonus)}"
                 if c.heroclass["ability"]:
-                    base_bonus = random.randint(15, 50) + 5 * rebirths
+                    base_bonus = (random.randint(1, 10) + 5) * (rebirths // 2)
                 base_str = f"{self.emojis.crit}️ {humanize_number(base_bonus)}"
                 attack += int((roll + base_bonus + crit_bonus + att_value) / pdef)
                 bonus = base_str + crit_str
                 report += (
                     f"**{self.escape(user.display_name)}**: "
-                    f"{self.emojis.dice}({roll}) + {self.emojis.berserk}{bonus} + {self.emojis.attack}{str(humanize_number(att_value))}\n"
+                    f"{self.emojis.dice}({roll}) + "
+                    f"{self.emojis.berserk}{bonus} + "
+                    f"{self.emojis.attack}{str(humanize_number(att_value))}\n"
                 )
             else:
                 attack += int((roll + att_value) / pdef) + rebirths
-                report += f"**{self.escape(user.display_name)}**: {self.emojis.dice}({roll}) + {self.emojis.attack}{str(humanize_number(att_value))}\n"
+                report += (
+                    f"**{self.escape(user.display_name)}**: "
+                    f"{self.emojis.dice}({roll}) + "
+                    f"{self.emojis.attack}{str(humanize_number(att_value))}\n"
+                )
+            if session.insight[0] == 1 and user.id != session.insight[1].user.id:
+                attack += int(session.insight[1].total_att * 0.2)
         for user in magic_list:
             try:
-                c = await Character.from_json(self.config, user)
+                c = await Character.from_json(self.config, user, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 continue
-            crit_mod = max(c.dex, c.luck) + (c.total_int // 20)
+            crit_mod = max(max(c.dex, c.luck) + (c.total_int // 20), 0)
             mod = 0
-            max_roll = 50 if c.rebirths >= 15 else 20
+            max_roll = 100 if c.rebirths >= 30 else 50 if c.rebirths >= 15 else 20
             if crit_mod != 0:
                 mod = round(crit_mod / 10)
             if c.rebirths < 15 < mod:
@@ -5580,7 +6700,7 @@ class Adventure(BaseCog):
                 max_roll = 20
             elif (mod + 1) > 45:
                 mod = 45
-            roll = random.randint((1 + mod), max_roll)
+            roll = max(random.randint((1 + mod), max_roll), 1)
             if c.heroclass.get("pet", {}).get("bonuses", {}).get("crit", False):
                 pet_crit = c.heroclass.get("pet", {}).get("bonuses", {}).get("crit", 0)
                 pet_crit = random.randint(pet_crit, 100)
@@ -5590,9 +6710,10 @@ class Adventure(BaseCog):
                     roll = random.randint(max_roll - 5, max_roll)
                 elif roll > 25 and pet_crit >= 95:
                     roll = random.randint(roll, max_roll)
+            roll_perc = roll / max_roll
             int_value = c.total_int
-            rebirths = c.rebirths * 3 if c.heroclass["name"] == "Wizard" else 0
-            if roll == 1:
+            rebirths = c.rebirths * (3 if c.heroclass["name"] == "Wizard" else 1)
+            if roll_perc < 0.10:
                 msg += _("{}**{}** almost set themselves on fire.\n").format(
                     failed_emoji, self.escape(user.display_name)
                 )
@@ -5605,39 +6726,51 @@ class Adventure(BaseCog):
                     magic += int((roll - bonus + int_value) / mdef)
                     report += (
                         f"**{self.escape(user.display_name)}**: "
-                        f"{self.emojis.dice}({roll}) + {self.emojis.magic_crit}{humanize_number(bonus)} + {self.emojis.magic}{str(humanize_number(int_value))}\n"
+                        f"{self.emojis.dice}({roll}) + "
+                        f"{self.emojis.magic_crit}{humanize_number(bonus)} + "
+                        f"{self.emojis.magic}{str(humanize_number(int_value))}\n"
                     )
-            elif roll == max_roll or (c.heroclass["name"] == "Wizard"):
+            elif roll_perc > 0.95 or (c.heroclass["name"] == "Wizard"):
                 crit_str = ""
                 crit_bonus = 0
                 base_bonus = random.randint(5, 10) + rebirths
                 base_str = f"{self.emojis.magic_crit}️ {humanize_number(base_bonus)}"
-                if roll == max_roll:
-                    msg += _("**{}** had a surge of energy.\n").format(
-                        self.escape(user.display_name)
-                    )
+                if roll_perc > 0.95:
+                    msg += _("**{}** had a surge of energy.\n").format(self.escape(user.display_name))
                     critlist.append(user)
-                    crit_bonus = random.randint(5, 20) + 2 * rebirths
+                    crit_bonus = (random.randint(5, 20)) + (rebirths * 2)
                     crit_str = f"{self.emojis.crit} {humanize_number(crit_bonus)}"
                 if c.heroclass["ability"]:
-                    base_bonus = random.randint(15, 50) + 5 * rebirths
+                    base_bonus = (random.randint(1, 10) + 5) * (rebirths // 2)
                     base_str = f"{self.emojis.magic_crit}️ {humanize_number(base_bonus)}"
                 magic += int((roll + base_bonus + crit_bonus + int_value) / mdef)
                 bonus = base_str + crit_str
                 report += (
                     f"**{self.escape(user.display_name)}**: "
-                    f"{self.emojis.dice}({roll}) + {bonus} + {self.emojis.magic}{humanize_number(int_value)}\n"
+                    f"{self.emojis.dice}({roll}) + "
+                    f"{bonus} + "
+                    f"{self.emojis.magic}{humanize_number(int_value)}\n"
                 )
             else:
                 magic += int((roll + int_value) / mdef) + c.rebirths // 5
-                report += f"**{self.escape(user.display_name)}**: {self.emojis.dice}({roll}) + {self.emojis.magic}{humanize_number(int_value)}\n"
+                report += (
+                    f"**{self.escape(user.display_name)}**: "
+                    f"{self.emojis.dice}({roll}) + "
+                    f"{self.emojis.magic}{humanize_number(int_value)}\n"
+                )
+            if session.insight[0] == 1 and user.id != session.insight[1].user.id:
+                attack += int(session.insight[1].total_int * 0.2)
         if fumble_count == len(attack_list):
             report += _("No one!")
         msg += report + "\n"
         for user in fumblelist:
             if user in session.fight:
+                if session.insight[0] == 1 and user.id != session.insight[1].user.id:
+                    attack -= int(session.insight[1].total_att * 0.2)
                 session.fight.remove(user)
-            elif user in session.magic:
+            elif user in session.magic and user.id != session.insight[1].user.id:
+                if session.insight[0] == 1 and user.id != session.insight[1].user.id:
+                    attack -= int(session.insight[1].total_int * 0.2)
                 session.magic.remove(user)
         return (fumblelist, critlist, attack, magic, msg)
 
@@ -5655,16 +6788,15 @@ class Adventure(BaseCog):
         failed_emoji = self.emojis.fumble
         for user in pray_list:
             try:
-                c = await Character.from_json(self.config, user)
+                c = await Character.from_json(self.config, user, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 continue
-
+            rebirths = c.rebirths * (2 if c.heroclass["name"] == "Cleric" else 1)
             if c.heroclass["name"] == "Cleric":
-                rebirths = c.rebirths * 3 if c.heroclass["name"] == "Cleric" else 0
-                crit_mod = max(c.dex, c.luck) + (c.total_int // 20)
+                crit_mod = max(max(c.dex, c.luck) + (c.total_int // 20), 0)
                 mod = 0
-                max_roll = 50 if c.rebirths >= 15 else 20
+                max_roll = 100 if c.rebirths >= 30 else 50 if c.rebirths >= 15 else 20
                 if crit_mod != 0:
                     mod = round(crit_mod / 10)
                 if c.rebirths < 15 < mod:
@@ -5672,35 +6804,29 @@ class Adventure(BaseCog):
                     max_roll = 20
                 elif (mod + 1) > 45:
                     mod = 45
-                roll = random.randint((1 + mod), max_roll)
+                roll = max(random.randint((1 + mod), max_roll), 1)
+                roll_perc = roll / max_roll
                 if len(fight_list + talk_list + magic_list) == 0:
-                    msg += _(
-                        "**{}** blessed like a madman but nobody was there to receive it.\n"
-                    ).format(self.escape(user.display_name))
-
-                if roll == 1:
+                    msg += _("**{}** blessed like a madman but nobody was there to receive it.\n").format(
+                        self.escape(user.display_name)
+                    )
+                if roll_perc < 0.15:
                     pray_att_bonus = 0
                     pray_diplo_bonus = 0
                     pray_magic_bonus = 0
                     if fight_list:
-                        pray_att_bonus = (5 * len(fight_list)) - (
-                            (5 * len(fight_list)) * max(c.rebirths * 0.01, 1.5)
-                        )
+                        pray_att_bonus = (5 * len(fight_list)) - ((5 * len(fight_list)) * max(rebirths * 0.01, 1.5))
                     if talk_list:
-                        pray_diplo_bonus = (5 * len(talk_list)) - (
-                            (5 * len(talk_list)) * max(c.rebirths * 0.01, 1.5)
-                        )
+                        pray_diplo_bonus = (5 * len(talk_list)) - ((5 * len(talk_list)) * max(rebirths * 0.01, 1.5))
                     if magic_list:
-                        pray_magic_bonus = (5 * len(magic_list)) - (
-                            (5 * len(magic_list)) * max(c.rebirths * 0.01, 1.5)
-                        )
+                        pray_magic_bonus = (5 * len(magic_list)) - ((5 * len(magic_list)) * max(rebirths * 0.01, 1.5))
                     attack -= pray_att_bonus
                     diplomacy -= pray_diplo_bonus
                     magic -= pray_magic_bonus
                     fumblelist.append(user)
                     msg += _(
                         "**{user}'s** sermon offended the mighty {god}. {failed_emoji}"
-                        "(-{len_f_list}{attack}/-{len_t_list}{talk}/-{len_m_list}{magic})\n"
+                        "(-{len_f_list}{attack}/-{len_t_list}{talk}/-{len_m_list}{magic}) {roll_emoji}({roll})\n"
                     ).format(
                         user=self.escape(user.display_name),
                         god=god,
@@ -5711,8 +6837,9 @@ class Adventure(BaseCog):
                         len_f_list=humanize_number(pray_att_bonus),
                         len_t_list=humanize_number(pray_diplo_bonus),
                         len_m_list=humanize_number(pray_magic_bonus),
+                        roll_emoji=self.emojis.dice,
+                        roll=roll,
                     )
-
                 else:
                     mod = roll // 3 if not c.heroclass["ability"] else roll
                     pray_att_bonus = 0
@@ -5721,31 +6848,28 @@ class Adventure(BaseCog):
 
                     if fight_list:
                         pray_att_bonus = int(
-                            (mod * len(fight_list))
-                            + ((mod * len(fight_list)) * max(c.rebirths * 0.01, 1.5))
+                            (mod * len(fight_list)) + ((mod * len(fight_list)) * max(rebirths * 0.05, 1.5))
                         )
                     if talk_list:
                         pray_diplo_bonus = int(
-                            (mod * len(talk_list))
-                            + ((mod * len(talk_list)) * max(c.rebirths * 0.01, 1.5))
+                            (mod * len(talk_list)) + ((mod * len(talk_list)) * max(rebirths * 0.05, 1.5))
                         )
                     if magic_list:
                         pray_magic_bonus = int(
-                            (mod * len(magic_list))
-                            + ((mod * len(magic_list)) * max(c.rebirths * 0.01, 1.5))
+                            (mod * len(magic_list)) + ((mod * len(magic_list)) * max(rebirths * 0.05, 1.5))
                         )
                     attack += pray_att_bonus
                     magic += pray_magic_bonus
                     diplomacy += pray_diplo_bonus
                     if roll == 50:
                         roll_msg = _(
-                            "{user} turned into an avatar of mighty {god}. "
-                            "(+{len_f_list}{attack}/+{len_t_list}{talk}/+{len_m_list}{magic})\n"
+                            "**{user}** turned into an avatar of mighty {god}. "
+                            "(+{len_f_list}{attack}/+{len_t_list}{talk}/+{len_m_list}{magic}) {roll_emoji}({roll})\n"
                         )
                     else:
                         roll_msg = _(
                             "**{user}** blessed you all in {god}'s name. "
-                            "(+{len_f_list}{attack}/+{len_t_list}{talk}/+{len_m_list}{magic})\n"
+                            "(+{len_f_list}{attack}/+{len_t_list}{talk}/+{len_m_list}{magic}) {roll_emoji}({roll})\n"
                         )
                     msg += roll_msg.format(
                         user=self.escape(user.display_name),
@@ -5756,6 +6880,8 @@ class Adventure(BaseCog):
                         len_f_list=humanize_number(pray_att_bonus),
                         len_t_list=humanize_number(pray_diplo_bonus),
                         len_m_list=humanize_number(pray_magic_bonus),
+                        roll_emoji=self.emojis.dice,
+                        roll=roll,
                     )
             else:
                 roll = random.randint(1, 10)
@@ -5769,18 +6895,18 @@ class Adventure(BaseCog):
                     talk_buff = 0
                     magic_buff = 0
                     if fight_list:
-                        attack_buff = 10 * (len(fight_list) + c.rebirths // 15)
+                        attack_buff = 10 * (len(fight_list) + rebirths // 15)
                     if talk_list:
-                        talk_buff = 10 * (len(talk_list) + c.rebirths // 15)
+                        talk_buff = 10 * (len(talk_list) + rebirths // 15)
                     if magic_list:
-                        magic_buff = 10 * (len(magic_list) + c.rebirths // 15)
+                        magic_buff = 10 * (len(magic_list) + rebirths // 15)
 
                     attack += attack_buff
                     magic += magic_buff
                     diplomacy += talk_buff
                     msg += _(
                         "**{user}'s** prayer called upon the mighty {god} to help you. "
-                        "(+{len_f_list}{attack}/+{len_t_list}{talk}/+{len_m_list}{magic})\n"
+                        "(+{len_f_list}{attack}/+{len_t_list}{talk}/+{len_m_list}{magic}) {roll_emoji}({roll})\n"
                     ).format(
                         user=self.escape(user.display_name),
                         god=god,
@@ -5790,6 +6916,8 @@ class Adventure(BaseCog):
                         len_f_list=humanize_number(attack_buff),
                         len_t_list=humanize_number(talk_buff),
                         len_m_list=humanize_number(magic_buff),
+                        roll_emoji=self.emojis.dice,
+                        roll=roll,
                     )
                 else:
                     fumblelist.append(user)
@@ -5803,6 +6931,7 @@ class Adventure(BaseCog):
 
     async def handle_talk(self, guild_id, fumblelist, critlist, diplomacy):
         session = self._sessions[guild_id]
+        cdef = max(session.monster_modified_stats["cdef"], 0.5)
         talk_list = list(set(session.talk))
         if len(talk_list) >= 1:
             report = _("Talking Party: \n\n")
@@ -5813,26 +6942,27 @@ class Adventure(BaseCog):
         failed_emoji = self.emojis.fumble
         for user in talk_list:
             try:
-                c = await Character.from_json(self.config, user)
+                c = await Character.from_json(self.config, user, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 continue
-            crit_mod = max(c.dex, c.luck) + (c.total_int // 50) + (c.total_cha // 20)
+            crit_mod = max(max(c.dex, c.luck) + (c.total_int // 50) + (c.total_cha // 20), 1)
             mod = 0
-            max_roll = 50 if c.rebirths >= 15 else 20
+            max_roll = 100 if c.rebirths >= 30 else 50 if c.rebirths >= 15 else 20
             if crit_mod != 0:
                 mod = round(crit_mod / 10)
             if c.rebirths < 15 < mod:
                 mod = 15
             elif (mod + 1) > 45:
                 mod = 45
-            roll = random.randint((1 + mod), max_roll)
+            roll = max(random.randint((1 + mod), max_roll), 1)
             dipl_value = c.total_cha
-            rebirths = c.rebirths * 3 if c.heroclass["name"] == "Bard" else 0
-            if roll == 1:
+            rebirths = c.rebirths * (3 if c.heroclass["name"] == "Bard" else 1)
+            roll_perc = roll / max_roll
+            if roll_perc < 0.10:
                 if c.heroclass["name"] == "Bard" and c.heroclass["ability"]:
                     bonus = random.randint(5, 15)
-                    diplomacy += roll - bonus + dipl_value + rebirths
+                    diplomacy += int((roll - bonus + dipl_value + rebirths) / cdef)
                     report += (
                         f"**{self.escape(user.display_name)}** "
                         f"🎲({roll}) +💥{bonus} +🗨{humanize_number(dipl_value)} | "
@@ -5843,39 +6973,47 @@ class Adventure(BaseCog):
                     )
                     fumblelist.append(user)
                     fumble_count += 1
-            elif roll == max_roll or c.heroclass["name"] == "Bard":
+            elif roll_perc > 0.95 or c.heroclass["name"] == "Bard":
                 crit_str = ""
                 crit_bonus = 0
                 base_bonus = random.randint(5, 10) + rebirths
-                if roll == max_roll:
-                    msg += _("**{}** made a compelling argument.\n").format(
-                        self.escape(user.display_name)
-                    )
+                if roll_perc > 0.95:
+                    msg += _("**{}** made a compelling argument.\n").format(self.escape(user.display_name))
                     critlist.append(user)
-                    crit_bonus = random.randint(5, 20) + 2 * rebirths
+                    crit_bonus = (random.randint(5, 20)) + (rebirths * 2)
                     crit_str = f"{self.emojis.crit} {crit_bonus}"
 
                 if c.heroclass["ability"]:
-                    base_bonus = random.randint(15, 50) + 5 * rebirths
+                    base_bonus = (random.randint(1, 10) + 5) * (rebirths // 2)
                 base_str = f"🎵 {humanize_number(base_bonus)}"
-                diplomacy += roll + base_bonus + crit_bonus + dipl_value
+                diplomacy += int((roll + base_bonus + crit_bonus + dipl_value) / cdef)
                 bonus = base_str + crit_str
                 report += (
                     f"**{self.escape(user.display_name)}** "
-                    f"{self.emojis.dice}({roll}) + {bonus} + {self.emojis.talk}{humanize_number(dipl_value)}\n"
+                    f"{self.emojis.dice}({roll}) + "
+                    f"{bonus} + "
+                    f"{self.emojis.talk}{humanize_number(dipl_value)}\n"
                 )
             else:
-                diplomacy += roll + dipl_value + c.rebirths // 5
-                report += f"**{self.escape(user.display_name)}** {self.emojis.dice}({roll}) + {self.emojis.talk}{humanize_number(dipl_value)}\n"
+                diplomacy += int((roll + dipl_value + c.rebirths // 5) / cdef)
+                report += (
+                    f"**{self.escape(user.display_name)}** "
+                    f"{self.emojis.dice}({roll}) + "
+                    f"{self.emojis.talk}{humanize_number(dipl_value)}\n"
+                )
+            if session.insight[0] == 1 and user.id != session.insight[1].user.id:
+                diplomacy += int(session.insight[1].total_cha * 0.2)
         if fumble_count == len(talk_list):
             report += _("No one!")
         msg = msg + report + "\n"
         for user in fumblelist:
             if user in talk_list:
+                if session.insight[0] == 1 and user.id != session.insight[1].user.id:
+                    diplomacy -= int(session.insight[1].total_cha * 0.2)
                 session.talk.remove(user)
         return (fumblelist, critlist, diplomacy, msg)
 
-    async def handle_basilisk(self, ctx: Context, failed):
+    async def handle_basilisk(self, ctx: commands.Context):
         session = self._sessions[ctx.guild.id]
         fight_list = list(set(session.fight))
         talk_list = list(set(session.talk))
@@ -5891,49 +7029,46 @@ class Adventure(BaseCog):
             elif req_item == "emoji" and session.reacted:
                 failed = False
             else:
-                for (
-                    user
-                ) in (
-                    participants
-                ):  # check if any fighter has an equipped mirror shield to give them a chance.
+                for user in participants:  # check if any fighter has an equipped mirror shield to give them a chance.
                     try:
-                        c = await Character.from_json(self.config, user)
+                        c = await Character.from_json(self.config, user, self._daily_bonus)
                     except Exception as exc:
                         log.exception("Error with the new character sheet", exc_info=exc)
                         continue
-                    if "Ainz Ooal Gown" in c.sets:
+                    if any(x in c.sets for x in ["The Supreme One", "Ainz Ooal Gown"]):
                         failed = False
                         break
                     with contextlib.suppress(KeyError):
                         current_equipment = c.get_current_equipment()
                         for item in current_equipment:
                             item_name = str(item)
-                            if item.rarity != "forged" and (
-                                req_item in item_name or "shiny" in item_name.lower()
-                            ):
+                            if item.rarity != "forged" and (req_item in item_name or "shiny" in item_name.lower()):
                                 failed = False
                                 break
         else:
             failed = False
         return failed
 
-    async def _add_rewards(self, ctx: Context, user, exp, cp, special):
+    async def _add_rewards(self, ctx: commands.Context, user, exp, cp, special):
         lock = self.get_lock(user)
         if not lock.locked():
             await lock.acquire()
         try:
-            c = await Character.from_json(self.config, user)
+            c = await Character.from_json(self.config, user, self._daily_bonus)
         except Exception as exc:
             log.exception("Error with the new character sheet", exc_info=exc)
             lock.release()
             return
         else:
+            rebirth_text = ""
             c.exp += exp
             member = ctx.guild.get_member(user.id)
             cp = max(cp, 0)
             if cp > 0:
-                with contextlib.suppress(BalanceTooHigh):
+                try:
                     await bank.deposit_credits(member, cp)
+                except BalanceTooHigh as e:
+                    await bank.set_balance(member, e.max_balance)
             extra = ""
             rebirthextra = ""
             lvl_start = c.lvl
@@ -5942,31 +7077,28 @@ class Adventure(BaseCog):
             levelup_emoji = self.emojis.level_up
             rebirth_emoji = self.emojis.rebirth
             if lvl_end >= c.maxlevel:
-                rebirthextra = _("{} You can now Rebirth {}").format(rebirth_emoji, user.mention)
+                rebirthextra = _("{} You can now rebirth {}").format(rebirth_emoji, user.mention)
             if lvl_start < lvl_end:
                 # recalculate free skillpoint pool based on new level and already spent points.
                 c.lvl = lvl_end
                 assigned_stats = c.skill["att"] + c.skill["cha"] + c.skill["int"]
-                starting_points = calculate_sp(lvl_start, c) + assigned_stats
-                ending_points = calculate_sp(lvl_end, c) + assigned_stats
+                starting_points = await calculate_sp(lvl_start, c) + assigned_stats
+                ending_points = await calculate_sp(lvl_end, c) + assigned_stats
 
                 if c.skill["pool"] < 0:
                     c.skill["pool"] = 0
                 c.skill["pool"] += ending_points - starting_points
                 if c.skill["pool"] > 0:
                     extra = _(" You have **{}** skill points available.").format(c.skill["pool"])
-                await smart_embed(
-                    ctx,
-                    _("{} {} is now level **{}**!{}\n{}").format(
-                        levelup_emoji, user.mention, lvl_end, extra, rebirthextra
-                    ),
+                rebirth_text = _("{} {} is now level **{}**!{}\n{}").format(
+                    levelup_emoji, user.mention, lvl_end, extra, rebirthextra
                 )
             if c.rebirths > 1:
                 roll = random.randint(1, 100)
                 if lvl_end == c.maxlevel:
                     roll += random.randint(50, 100)
                 if special is False:
-                    special = [0, 0, 0, 0, 0]
+                    special = [0, 0, 0, 0, 0, 0]
                     if c.rebirths > 1 and roll < 50:
                         special[0] += 1
                     if c.rebirths > 5 and roll < 30:
@@ -5975,7 +7107,7 @@ class Adventure(BaseCog):
                         special[2] += 1
                     if c.rebirths > 15 and roll < 5:
                         special[3] += 1
-                    if special == [0, 0, 0, 0, 0]:
+                    if special == [0, 0, 0, 0, 0, 0]:
                         special = False
                 else:
                     if c.rebirths > 1 and roll < 50:
@@ -5986,17 +7118,18 @@ class Adventure(BaseCog):
                         special[2] += 1
                     if c.rebirths > 15 and roll < 5:
                         special[3] += 1
-                    if special == [0, 0, 0, 0, 0]:
+                    if special == [0, 0, 0, 0, 0, 0]:
                         special = False
             if special is not False:
                 c.treasure = [sum(x) for x in zip(c.treasure, special)]
             await self.config.user(user).set(await c.to_json(self.config))
+            return rebirth_text
         finally:
             lock = self.get_lock(user)
             with contextlib.suppress(Exception):
                 lock.release()
 
-    async def _adv_countdown(self, ctx: Context, seconds, title) -> asyncio.Task:
+    async def _adv_countdown(self, ctx: commands.Context, seconds, title) -> asyncio.Task:
         await self._data_check(ctx)
 
         async def adv_countdown():
@@ -6004,20 +7137,25 @@ class Adventure(BaseCog):
             adv_end = await self._get_epoch(secondint)
             timer, done, sremain = await self._remaining(adv_end)
             message_adv = await ctx.send(f"⏳ [{title}] {timer}s")
+            deleted = False
             while not done:
                 timer, done, sremain = await self._remaining(adv_end)
                 self._adventure_countdown[ctx.guild.id] = (timer, done, sremain)
                 if done:
-                    await message_adv.delete()
+                    if not deleted:
+                        await message_adv.delete()
                     break
-                elif int(sremain) % 5 == 0:
-                    await message_adv.edit(content=f"⏳ [{title}] {timer}s")
+                elif not deleted and int(sremain) % 5 == 0:
+                    try:
+                        await message_adv.edit(content=f"⏳ [{title}] {timer}s")
+                    except discord.NotFound:
+                        deleted = True
                 await asyncio.sleep(1)
             log.debug("Timer countdown done.")
 
         return ctx.bot.loop.create_task(adv_countdown())
 
-    async def _cart_countdown(self, ctx: Context, seconds, title, room=None) -> asyncio.Task:
+    async def _cart_countdown(self, ctx: commands.Context, seconds, title, room=None) -> asyncio.Task:
         room = room or ctx
         await self._data_check(ctx)
 
@@ -6026,14 +7164,19 @@ class Adventure(BaseCog):
             cart_end = await self._get_epoch(secondint)
             timer, done, sremain = await self._remaining(cart_end)
             message_cart = await room.send(f"⏳ [{title}] {timer}s")
+            deleted = False
             while not done:
                 timer, done, sremain = await self._remaining(cart_end)
                 self._trader_countdown[ctx.guild.id] = (timer, done, sremain)
                 if done:
-                    await message_cart.delete()
+                    if not deleted:
+                        await message_cart.delete()
                     break
-                if int(sremain) % 5 == 0:
-                    await message_cart.edit(content=f"⏳ [{title}] {timer}s")
+                if not deleted and int(sremain) % 5 == 0:
+                    try:
+                        await message_cart.edit(content=f"⏳ [{title}] {timer}s")
+                    except discord.NotFound:
+                        deleted = True
                 await asyncio.sleep(1)
 
         return ctx.bot.loop.create_task(cart_countdown())
@@ -6043,7 +7186,7 @@ class Adventure(BaseCog):
         with contextlib.suppress(discord.HTTPException):
             await msg.clear_reactions()
 
-    async def _data_check(self, ctx: Context):
+    async def _data_check(self, ctx: commands.Context):
         try:
             self._adventure_countdown[ctx.guild.id]
         except KeyError:
@@ -6063,10 +7206,21 @@ class Adventure(BaseCog):
         epoch += seconds
         return epoch
 
+    @staticmethod
+    async def _title_case(phrase: str):
+        exceptions = ["a", "and", "in", "of", "or", "the"]
+        lowercase_words = re.split(" ", phrase.lower())
+        final_words = [lowercase_words[0].capitalize()]
+        final_words += [word if word in exceptions else word.capitalize() for word in lowercase_words[1:]]
+        return " ".join(final_words)
+
     @commands.Cog.listener()
     async def on_message_without_command(self, message):
         await self._ready_event.wait()
-        if not message.guild:
+        if message.guild is not None:
+            if await self.bot.cog_disabled_in_guild(self, message.guild):
+                return
+        else:
             return
         channels = await self.config.guild(message.guild).cart_channels()
         if not channels:
@@ -6095,7 +7249,7 @@ class Adventure(BaseCog):
         # lower gives you better chances for better items
         max_roll = INITIAL_MAX_ROLL - round(c.luck) - (c.rebirths // 2)
         top_range = max(max_roll, INITIAL_MAX_ROLL - MAX_CHEST_LUCK)
-        roll = random.randint(1, top_range)
+        roll = max(random.randint(1, top_range), 1)
         if chest_type == "normal":
             if roll <= INITIAL_MAX_ROLL * 0.05:  # 5% to roll rare
                 rarity = "rare"
@@ -6122,6 +7276,11 @@ class Adventure(BaseCog):
                 rarity = "epic"
             else:
                 rarity = "rare"  # 5% to roll rare
+        elif chest_type == "ascended":
+            if roll <= INITIAL_MAX_ROLL * 0.55:  # 55% to roll set
+                rarity = "ascended"
+            else:
+                rarity = "legendary"  # 45% to roll legendary
         elif chest_type == "pet":
             if roll <= INITIAL_MAX_ROLL * 0.05:  # 5% to roll legendary
                 rarity = "legendary"
@@ -6134,22 +7293,18 @@ class Adventure(BaseCog):
         elif chest_type == "set":
             if roll <= INITIAL_MAX_ROLL * 0.55:  # 55% to roll set
                 rarity = "set"
+            elif roll <= INITIAL_MAX_ROLL * 0.87:
+                rarity = "ascended"  # 45% to roll legendary
             else:
                 rarity = "legendary"  # 45% to roll legendary
 
         return await self._genitem(rarity)
 
     async def _open_chests(
-        self,
-        ctx: Context,
-        user: discord.Member,
-        chest_type: str,
-        amount: int,
-        character: Character,
+        self, ctx: commands.Context, chest_type: str, amount: int, character: Character,
     ):
         items = {}
-        for i in range(0, max(amount, 0)):
-            await asyncio.sleep(0)
+        async for _loop_counter in AsyncIter(range(0, max(amount, 0)), steps=100):
             item = await self._roll_chest(chest_type, character)
             item_name = str(item)
             if item_name in items:
@@ -6160,7 +7315,7 @@ class Adventure(BaseCog):
         await self.config.user(ctx.author).set(await character.to_json(self.config))
         return items
 
-    async def _open_chest(self, ctx: Context, user, chest_type, character):
+    async def _open_chest(self, ctx: commands.Context, user, chest_type, character):
         if hasattr(user, "display_name"):
             chest_msg = _("{} is opening a treasure chest. What riches lay inside?").format(
                 self.escape(user.display_name)
@@ -6228,10 +7383,7 @@ class Adventure(BaseCog):
         if hasattr(user, "display_name"):
             chest_msg2 = (
                 _("{user} found {item} [{slot}] | Lvl req {lv}.").format(
-                    user=self.escape(user.display_name),
-                    item=str(item),
-                    slot=slot,
-                    lv=equip_level(character, item),
+                    user=self.escape(user.display_name), item=str(item), slot=slot, lv=equip_level(character, item),
                 )
                 + f" (ATT: {str(att)}, "
                 f"CHA: {str(cha)}, "
@@ -6273,13 +7425,9 @@ class Adventure(BaseCog):
 
         start_adding_reactions(open_msg, self._treasure_controls.keys())
         if hasattr(user, "id"):
-            pred = ReactionPredicate.with_emojis(
-                tuple(self._treasure_controls.keys()), open_msg, user
-            )
+            pred = ReactionPredicate.with_emojis(tuple(self._treasure_controls.keys()), open_msg, user)
         else:
-            pred = ReactionPredicate.with_emojis(
-                tuple(self._treasure_controls.keys()), open_msg, ctx.author
-            )
+            pred = ReactionPredicate.with_emojis(tuple(self._treasure_controls.keys()), open_msg, ctx.author)
         try:
             react, user = await self.bot.wait_for("reaction_add", check=pred, timeout=60)
         except asyncio.TimeoutError:
@@ -6302,9 +7450,11 @@ class Adventure(BaseCog):
             price = self._sell(character, item)
             price = max(price, 0)
             if price > 0:
-                with contextlib.suppress(BalanceTooHigh):
+                try:
                     await bank.deposit_credits(ctx.author, price)
-            currency_name = await bank.get_currency_name(ctx.guild)
+                except BalanceTooHigh as e:
+                    await bank.set_balance(ctx.author, e.max_balance)
+            currency_name = await bank.get_currency_name(ctx.guild,)
             if str(currency_name).startswith("<"):
                 currency_name = "credits"
             await open_msg.edit(
@@ -6321,8 +7471,9 @@ class Adventure(BaseCog):
                 )
             )
             await self._clear_react(open_msg)
+            character.last_known_currency = await bank.get_balance(ctx.author)
+            character.last_currency_check = time.time()
             await self.config.user(ctx.author).set(await character.to_json(self.config))
-            return
         elif self._treasure_controls[react.emoji] == "equip":
             equiplevel = equip_level(character, item)
             if self.is_dev(ctx.author):
@@ -6332,7 +7483,8 @@ class Adventure(BaseCog):
                 await self.config.user(ctx.author).set(await character.to_json(self.config))
                 return await smart_embed(
                     ctx,
-                    f"**{self.escape(ctx.author.display_name)}**, You need to be level `{equiplevel}` to equip this item, I've put it in your backpack",
+                    f"**{self.escape(ctx.author.display_name)}**, you need to be level "
+                    f"`{equiplevel}` to equip this item. I've put it in your backpack.",
                 )
             if not getattr(character, item.slot[0]):
                 equip_msg = box(
@@ -6343,10 +7495,7 @@ class Adventure(BaseCog):
                 )
             else:
                 equip_msg = box(
-                    _(
-                        "{user} equipped {item} "
-                        "({slot} slot) and put {old_item} into their backpack."
-                    ).format(
+                    _("{user} equipped {item} ({slot} slot) and put {old_item} into their backpack.").format(
                         user=self.escape(ctx.author.display_name),
                         item=item,
                         slot=slot,
@@ -6357,7 +7506,6 @@ class Adventure(BaseCog):
             await open_msg.edit(content=equip_msg)
             character = await character.equip_item(item, False, self.is_dev(ctx.author))
             await self.config.user(ctx.author).set(await character.to_json(self.config))
-            return
         else:
             await character.add_to_backpack(item)
             await open_msg.edit(
@@ -6372,7 +7520,6 @@ class Adventure(BaseCog):
             )
             await self._clear_react(open_msg)
             await self.config.user(ctx.author).set(await character.to_json(self.config))
-            return
 
     @staticmethod
     async def _remaining(epoch):
@@ -6391,32 +7538,33 @@ class Adventure(BaseCog):
             out = "{:01d}:{:02d}:{:02d}".format(h, m, s)
         return (out, finish, remaining)
 
-    async def _reward(self, ctx: Context, userlist, amount, modif, special):
+    async def _reward(self, ctx: commands.Context, userlist, amount, modif, special):
         if modif == 0:
             modif = 0.5
-        weekend = datetime.today().weekday() in [5, 6]
-        wedfriday = datetime.today().weekday() in [2, 4]
-        daymult = 3 if weekend else 2 if wedfriday else 1
+        daymult = self._daily_bonus.get(str(datetime.today().isoweekday()), 0)
         xp = max(1, round(amount))
         cp = max(1, round(amount))
         newxp = 0
         newcp = 0
         rewards_list = []
         phrase = ""
-        for user in userlist:
+        reward_message = ""
+        currency_name = await bank.get_currency_name(ctx.guild,)
+        can_embed = not ctx.guild or (await _config.guild(ctx.guild).embed() and await ctx.embed_requested())
+        async for user in AsyncIter(userlist, steps=100):
             self._rewards[user.id] = {}
             try:
-                c = await Character.from_json(self.config, user)
+                c = await Character.from_json(self.config, user, self._daily_bonus)
             except Exception as exc:
                 log.exception("Error with the new character sheet", exc_info=exc)
                 continue
-            userxp = int(xp + (xp * 0.5 * c.rebirths) + (xp * 0.1 * min(250, c.total_int / 10)))
+            userxp = int(xp + (xp * 0.5 * c.rebirths) + max((xp * 0.1 * min(250, c.total_int / 10)), 0))
             # This got exponentially out of control before checking 1 skill
             # To the point where you can spec into only INT and
             # Reach level 1000 in a matter of days
-            usercp = int(cp + (cp * c.luck) // 2)
-            userxp = int(userxp * (c.gear_set_bonus.get("xpmult", 1) + daymult - 1))
-            usercp = int(usercp * (c.gear_set_bonus.get("cpmult", 1) + daymult - 1))
+            usercp = int(cp + max(cp * c.luck, 0) // 2)
+            userxp = int(userxp * (c.gear_set_bonus.get("xpmult", 1) + daymult))
+            usercp = int(usercp * (c.gear_set_bonus.get("cpmult", 1) + daymult))
             newxp += userxp
             newcp += usercp
             roll = random.randint(1, 5)
@@ -6430,17 +7578,25 @@ class Adventure(BaseCog):
                 petcp = int(usercp * c.heroclass["pet"]["bonus"])
                 newcp += petcp
                 usercp += petcp
-                self._rewards[user.id]["cp"] = usercp + petcp
+                self._rewards[user.id]["cp"] = usercp
+                reward_message += "{mention} gained {xp} XP and {coin} {currency}.\n".format(
+                    mention=user.mention if can_embed else f"**{user.display_name}**",
+                    xp=humanize_number(int(userxp)),
+                    coin=humanize_number(int(usercp)),
+                    currency=currency_name,
+                )
                 percent = round((c.heroclass["pet"]["bonus"] - 1.0) * 100)
-                phrase += _(
-                    "\n**{user}** received a **{percent}%** reward bonus from their {pet_name}."
-                ).format(
-                    user=self.escape(user.display_name),
-                    percent=str(percent),
-                    pet_name=c.heroclass["pet"]["name"],
+                phrase += _("\n**{user}** received a **{percent}%** reward bonus from their {pet_name}.").format(
+                    user=self.escape(user.display_name), percent=str(percent), pet_name=c.heroclass["pet"]["name"],
                 )
 
             else:
+                reward_message += "{mention} gained {xp} XP and {coin} {currency}.\n".format(
+                    mention=user.mention,
+                    xp=humanize_number(int(userxp)),
+                    coin=humanize_number(int(usercp)),
+                    currency=currency_name,
+                )
                 self._rewards[user.id]["xp"] = userxp
                 self._rewards[user.id]["cp"] = usercp
             if special is not False:
@@ -6449,19 +7605,18 @@ class Adventure(BaseCog):
                 self._rewards[user.id]["special"] = False
             rewards_list.append(f"**{self.escape(user.display_name)}**")
 
-        currency_name = await bank.get_currency_name(ctx.guild)
+        self._reward_message[ctx.message.id] = reward_message
         to_reward = " and ".join(
-            [", ".join(rewards_list[:-1]), rewards_list[-1]]
-            if len(rewards_list) > 2
-            else rewards_list
+            [", ".join(rewards_list[:-1]), rewards_list[-1]] if len(rewards_list) > 2 else rewards_list
         )
 
         word = "has" if len(userlist) == 1 else "have"
         if special is not False and sum(special) == 1:
-            types = [" normal", " rare", "n epic", " legendary", " set"]
+            types = [" normal", " rare", "n epic", " legendary", "n ascended", " set"]
             chest_type = types[special.index(1)]
             phrase += _(
-                "\n{b_reward} {word} been awarded {xp} xp and found {cp} {currency_name} (split based on stats). "
+                "\n{b_reward} {word} been awarded {xp} xp and found "
+                "{cp} {currency_name} (split based on stats). "
                 "You also secured **a{chest_type} treasure chest**!"
             ).format(
                 b_reward=to_reward,
@@ -6496,7 +7651,9 @@ class Adventure(BaseCog):
 
     @staticmethod
     def _sell(c: Character, item: Item, *, amount: int = 1):
-        if item.rarity == "legendary":
+        if item.rarity == "ascended":
+            base = (5000, 10000)
+        elif item.rarity == "legendary":
             base = (1000, 2000)
         elif item.rarity == "epic":
             base = (500, 750)
@@ -6504,20 +7661,20 @@ class Adventure(BaseCog):
             base = (250, 500)
         else:
             base = (10, 100)
-        price = random.randint(base[0], base[1]) * item.max_main_stat
-        price += price * int((c.total_cha) / 1000)
+        price = random.randint(base[0], base[1]) * abs(item.max_main_stat)
+        price += price * max(int((c.total_cha) / 1000), -1)
 
         if c.luck > 0:
             price = price + round(price * (c.luck / 1000))
         if c.luck < 0:
             price = price - round(price * (abs(c.luck) / 1000))
-            if price < 0:
-                price = 0
+        if price < 0:
+            price = 0
         price += round(price * min(0.1 * c.rebirths / 15, 0.4))
 
         return max(price, base[0])
 
-    async def _trader(self, ctx: Context, bypass=False):
+    async def _trader(self, ctx: commands.Context, bypass=False):
         em_list = ReactionPredicate.NUMBER_EMOJIS
 
         cart = await self.config.cart_name()
@@ -6547,7 +7704,7 @@ class Adventure(BaseCog):
         self._curent_trader_stock[ctx.guild.id] = (stockcount, controls)
 
         stock = await self._trader_get_items(stockcount)
-        currency_name = await bank.get_currency_name(ctx.guild)
+        currency_name = await bank.get_currency_name(ctx.guild,)
         if str(currency_name).startswith("<"):
             currency_name = "credits"
         for (index, item) in enumerate(stock):
@@ -6618,7 +7775,7 @@ class Adventure(BaseCog):
             rarity_roll = random.random()
             #  rarity_roll = .9
             # 1% legendary
-            if rarity_roll >= 0.99:
+            if rarity_roll >= 0.95:
                 item = await self._genitem("legendary")
                 # min. 10 stat for legendary, want to be about 50k
                 price = random.randint(2500, 5000)
@@ -6639,9 +7796,7 @@ class Adventure(BaseCog):
             # 35% normal
             price *= item.max_main_stat
 
-            items.update(
-                {item.name: {"itemname": item.name, "item": item, "price": price, "lvl": item.lvl}}
-            )
+            items.update({item.name: {"itemname": item.name, "item": item, "price": price, "lvl": item.lvl}})
 
         for (index, item) in enumerate(items):
             output.update({index: items[item]})
@@ -6652,6 +7807,8 @@ class Adventure(BaseCog):
             self.cleanup_loop.cancel()
         if self._init_task:
             self._init_task.cancel()
+        if self.gb_task:
+            self.gb_task.cancel()
 
         for (msg_id, task) in self.tasks.items():
             task.cancel()
@@ -6660,9 +7817,7 @@ class Adventure(BaseCog):
             with contextlib.suppress(Exception):
                 lock.release()
 
-    async def get_leaderboard(
-        self, positions: int = None, guild: discord.Guild = None
-    ) -> List[tuple]:
+    async def get_leaderboard(self, positions: int = None, guild: discord.Guild = None) -> List[tuple]:
         """Gets the Adventure's leaderboard.
 
         Parameters
@@ -6685,7 +7840,7 @@ class Adventure(BaseCog):
                 if not guild.get_member(acc):
                     del raw_accounts[acc]
         raw_accounts_new = {}
-        for (k, v) in raw_accounts.items():
+        async for (k, v) in AsyncIter(raw_accounts.items(), steps=100):
             user_data = {}
             for item in ["lvl", "rebirths", "set_items"]:
                 if item not in v:
@@ -6708,17 +7863,21 @@ class Adventure(BaseCog):
             return sorted_acc[:positions]
 
     @commands.command()
-    @commands.bot_has_permissions(add_reactions=True)
+    @commands.bot_has_permissions(add_reactions=True, embed_links=True)
     @commands.guild_only()
-    async def aleaderboard(self, ctx: Context, show_global: bool = False):
+    async def aleaderboard(self, ctx: commands.Context, show_global: bool = False):
         """Print the leaderboard."""
         guild = ctx.guild
-        rebirth_sorted = await self.get_leaderboard(
-            guild=guild if not show_global else None, positions=40
-        )
+        rebirth_sorted = await self.get_leaderboard(guild=guild if not show_global else None)
         if rebirth_sorted:
-            pages = await self._format_leaderboard_pages(ctx, accounts=rebirth_sorted)
-            await menu(ctx, pages, DEFAULT_CONTROLS, timeout=60)
+            await LeaderboardMenu(
+                source=LeaderboardSource(entries=rebirth_sorted),
+                delete_message_after=True,
+                clear_reactions_after=True,
+                timeout=60,
+                cog=self,
+                show_global=show_global,
+            ).start(ctx=ctx)
         else:
             await smart_embed(ctx, _("There are no adventurers in the server."))
 
@@ -6754,7 +7913,7 @@ class Adventure(BaseCog):
                 if not guild.get_member(acc):
                     del raw_accounts[acc]
         raw_accounts_new = {}
-        for (k, v) in raw_accounts.items():
+        async for (k, v) in AsyncIter(raw_accounts.items(), steps=200):
             user_data = {}
             for item in ["adventures", "rebirths"]:
                 if item not in v:
@@ -6776,9 +7935,54 @@ class Adventure(BaseCog):
             raw_accounts_new.update(user_data)
 
         sorted_acc = sorted(
-            raw_accounts_new.items(),
-            key=lambda x: (x[1].get(keyword, 0), x[1].get("rebirths", 0)),
-            reverse=True,
+            raw_accounts_new.items(), key=lambda x: (x[1].get(keyword, 0), x[1].get("rebirths", 0)), reverse=True,
+        )
+        if positions is None:
+            return sorted_acc
+        else:
+            return sorted_acc[:positions]
+
+    async def get_global_negaverse_scoreboard(self, positions: int = None, guild: discord.Guild = None) -> List[tuple]:
+        """Gets the bank's leaderboard.
+
+        Parameters
+        ----------
+        positions : `int`
+            The number of positions to get
+        guild : discord.Guild
+            The guild to get the leaderboard of. If this
+            is provided, get only guild members on the leaderboard
+
+        Returns
+        -------
+        `list` of `tuple`
+            The sorted leaderboard in the form of :code:`(user_id, raw_account)`
+
+        Raises
+        ------
+        TypeError
+            If the bank is guild-specific and no guild was specified
+        """
+        raw_accounts = await self.config.all_users()
+        if guild is not None:
+            tmp = raw_accounts.copy()
+            for acc in tmp:
+                if not guild.get_member(acc):
+                    del raw_accounts[acc]
+        raw_accounts_new = {}
+        async for (k, v) in AsyncIter(raw_accounts.items(), steps=200):
+            user_data = {}
+            for (vk, vi) in v.items():
+                if vk in ["nega"]:
+                    for (s, sv) in vi.items():
+                        user_data.update(vi)
+
+            if user_data:
+                user_data = {k: user_data}
+            raw_accounts_new.update(user_data)
+
+        sorted_acc = sorted(
+            raw_accounts_new.items(), key=lambda x: (x[1].get("wins", 0), x[1].get("loses", 0)), reverse=True,
         )
         if positions is None:
             return sorted_acc
@@ -6786,59 +7990,61 @@ class Adventure(BaseCog):
             return sorted_acc[:positions]
 
     @commands.command()
-    @commands.bot_has_permissions(add_reactions=True)
+    @commands.bot_has_permissions(add_reactions=True, embed_links=True)
     @commands.guild_only()
-    async def scoreboard(
-        self, ctx: Context, stats: Optional[str] = None, show_global: bool = False
-    ):
-        """Print the scoreboard.
+    async def scoreboard(self, ctx: commands.Context, show_global: bool = False):
+        """Print the scoreboard."""
 
-        Defaults to top 10 based on wins.
-        """
-        possible_stats = ["wins", "loses", "fight", "spell", "talk", "pray", "run", "fumbles"]
-        if stats and stats.lower() not in possible_stats:
-            return await smart_embed(
-                ctx,
-                _("Stats must be one of the following: {}").format(humanize_list(possible_stats)),
-            )
-        elif stats is None:
-            stats = "wins"
-
-        guild = ctx.guild
-        rebirth_sorted = await self.get_global_scoreboard(
-            guild=guild if not show_global else None, keyword=stats.lower(), positions=40
-        )
+        rebirth_sorted = await self.get_global_scoreboard(guild=ctx.guild if not show_global else None, keyword="wins")
         if rebirth_sorted:
-            pages = await self._format_scoreboard_pages(
-                ctx, accounts=rebirth_sorted, stats=stats.lower()
-            )
-            await menu(ctx, pages, DEFAULT_CONTROLS, timeout=60)
+            await ScoreBoardMenu(
+                source=ScoreboardSource(entries=rebirth_sorted, stat="wins"),
+                delete_message_after=True,
+                clear_reactions_after=True,
+                timeout=60,
+                cog=self,
+                show_global=show_global,
+            ).start(ctx=ctx)
         else:
             await smart_embed(ctx, _("There are no adventurers in the server."))
 
     @commands.command()
-    @commands.bot_has_permissions(add_reactions=True)
+    @commands.bot_has_permissions(add_reactions=True, embed_links=True)
     @commands.guild_only()
-    async def wscoreboard(self, ctx: Context, show_global: bool = False):
-        """Print the weekly scoreboard.
+    async def nvsb(self, ctx: commands.Context, show_global: bool = False):
+        """Print the negaverse scoreboard."""
+        guild = ctx.guild
+        rebirth_sorted = await self.get_global_negaverse_scoreboard(guild=guild if not show_global else None)
+        if rebirth_sorted:
+            await BaseMenu(
+                source=NVScoreboardSource(entries=rebirth_sorted),
+                delete_message_after=True,
+                clear_reactions_after=True,
+                timeout=60,
+            ).start(ctx=ctx)
+        else:
+            await smart_embed(ctx, _("There are no adventurers in the server."))
 
-        Defaults to top 10 based on wins.
-        """
+    @commands.command()
+    @commands.bot_has_permissions(add_reactions=True, embed_links=True)
+    @commands.guild_only()
+    async def wscoreboard(self, ctx: commands.Context, show_global: bool = False):
+        """Print the weekly scoreboard."""
 
         stats = "adventures"
         guild = ctx.guild
         adventures = await self.get_weekly_scoreboard(guild=guild if not show_global else None)
         if adventures:
-            pages = await self._format_scoreboard_pages(
-                ctx, accounts=adventures, stats=stats.lower(), positions=40
-            )
-            await menu(ctx, pages, DEFAULT_CONTROLS, timeout=60)
+            await BaseMenu(
+                source=WeeklyScoreboardSource(entries=adventures, stat=stats.lower()),
+                delete_message_after=True,
+                clear_reactions_after=True,
+                timeout=60,
+            ).start(ctx=ctx)
         else:
             await smart_embed(ctx, _("No stats to show for this week."))
 
-    async def get_weekly_scoreboard(
-        self, positions: int = None, guild: discord.Guild = None
-    ) -> List[tuple]:
+    async def get_weekly_scoreboard(self, positions: int = None, guild: discord.Guild = None) -> List[tuple]:
         """Gets the bank's leaderboard.
 
         Parameters
@@ -6868,7 +8074,7 @@ class Adventure(BaseCog):
                 if not guild.get_member(acc):
                     del raw_accounts[acc]
         raw_accounts_new = {}
-        for (k, v) in raw_accounts.items():
+        async for (k, v) in AsyncIter(raw_accounts.items(), steps=200):
             user_data = {}
             for item in ["weekly_score"]:
                 if item not in v:
@@ -6887,132 +8093,288 @@ class Adventure(BaseCog):
             raw_accounts_new.update(user_data)
 
         sorted_acc = sorted(
-            raw_accounts_new.items(),
-            key=lambda x: (x[1].get(keyword, 0), x[1].get("rebirths", 0)),
-            reverse=True,
+            raw_accounts_new.items(), key=lambda x: (x[1].get(keyword, 0), x[1].get("rebirths", 0)), reverse=True,
         )
         if positions is None:
             return sorted_acc
         else:
             return sorted_acc[:positions]
 
-    async def _format_leaderboard_pages(self, ctx: Context, **kwargs) -> List[str]:
-        _accounts = kwargs.pop("accounts", {})
-        rebirth_len = len(humanize_number(_accounts[0][1]["rebirths"])) + 3
-        account_number = len(_accounts)
-        pos_len = len(humanize_number(account_number)) + 2
-
-        rebirth_len = (len("Rebirths") if len("Rebirths") > rebirth_len else rebirth_len) + 2
-        set_piece_len = len("Set Pieces") + 2
-        level_len = len("Level") + 2
-        header = f"{'#':{pos_len}}{'Rebirths':{rebirth_len}}{'Level':{level_len}}{'Set Pieces':{set_piece_len}}{'Name':2}"
-
-        if ctx is not None:
-            author = ctx.author
-        else:
-            author = None
-
-        if getattr(ctx, "guild", None):
-            guild = ctx.guild
-        else:
-            guild = None
-        entries = [header]
-        pages = []
-        for (pos, (user_id, account_data)) in enumerate(_accounts, start=1):
-            if guild is not None:
-                member = guild.get_member(user_id)
-            else:
-                member = None
-
-            if member is not None:
-                username = member.display_name
-            else:
-                user = self.bot.get_user(user_id)
-                if user is None:
-                    username = user_id
-                else:
-                    username = user.name
-
-            if user_id == author.id:
-                # Highlight the author's position
-                username = f"<<{username}>>"
-
-            pos_str = humanize_number(pos)
-            balance = humanize_number(account_data["rebirths"])
-            set_items = humanize_number(account_data["set_items"])
-            level = humanize_number(account_data["lvl"])
-
-            data = (
-                f"{f'{pos_str}.': <{pos_len}} "
-                f"{balance: <{rebirth_len}} "
-                f"{level: <{level_len}} "
-                f"{set_items: <{set_piece_len}} "
-                f"{username}"
+    @commands.command(name="apayday", cooldown_after_parsing=True)
+    @has_separated_economy()
+    @commands.cooldown(rate=1, per=600, type=commands.BucketType.user)
+    async def commands_apayday(self, ctx: commands.Context):
+        """Get some free gold."""
+        author = ctx.author
+        adventure_credits_name = await bank.get_currency_name(ctx.guild)
+        amount = 500  # Make Customizable?
+        try:
+            await bank.deposit_credits(author, amount)
+        except BalanceTooHigh as exc:
+            await bank.set_balance(author, exc.max_balance)
+            await smart_embed(
+                ctx,
+                _(
+                    "You're struggling to move under the weight of all your {currency}!"
+                    "Please spend some more \N{GRIMACING FACE}\n\n"
+                    "You currently have {new_balance} {currency}."
+                ).format(currency=adventure_credits_name, new_balance=humanize_number(exc.max_balance)),
             )
-            entries.append(data)
-            if pos % 10 == 0:
-                pages.append(box("\n".join(entries), lang="md"))
-                entries = [header]
-            elif account_number == pos:
-                pages.append(box("\n".join(entries), lang="md"))
-        return pages
-
-    async def _format_scoreboard_pages(self, ctx: Context, **kwargs) -> List[str]:
-        _accounts = kwargs.pop("accounts", {})
-        _importantStats = kwargs.pop("stats", "wins")
-        stats_len = len(humanize_number(_accounts[0][1][_importantStats])) + 3
-        account_number = len(_accounts)
-        pos_len = len(humanize_number(account_number)) + 2
-
-        stats_plural = _importantStats if _importantStats.endswith("s") else f"{_importantStats}s"
-        stats_len = (len(stats_plural) if len(stats_plural) > stats_len else stats_len) + 2
-        rebirth_len = len("Rebirths") + 2
-        header = f"{'#':{pos_len}}{stats_plural.title().ljust(stats_len)}{'Rebirths':{rebirth_len}}{'Name':2}"
-
-        if ctx is not None:
-            author = ctx.author
         else:
-            author = None
-
-        if getattr(ctx, "guild", None):
-            guild = ctx.guild
-        else:
-            guild = None
-        entries = [header]
-        pages = []
-        for (pos, (user_id, account_data)) in enumerate(_accounts, start=1):
-            if guild is not None:
-                member = guild.get_member(user_id)
-            else:
-                member = None
-
-            if member is not None:
-                username = member.display_name
-            else:
-                user = self.bot.get_user(user_id)
-                if user is None:
-                    username = user_id
-                else:
-                    username = user.name
-
-            if user_id == author.id:
-                # Highlight the author's position
-                username = f"<<{username}>>"
-
-            pos_str = humanize_number(pos)
-            rebirths = humanize_number(account_data["rebirths"])
-            stats_value = humanize_number(account_data[_importantStats.lower()])
-
-            data = (
-                f"{f'{pos_str}.': <{pos_len}} "
-                f"{stats_value: <{stats_len}} "
-                f"{rebirths: <{rebirth_len}} "
-                f"{username}"
+            await smart_embed(
+                ctx,
+                _(
+                    "You receive a letter by post from the town's courier! "
+                    "{author}, you've gained some interest on your {currency}. "
+                    "You've been paid +{amount} {currency}!\n\n"
+                    "You currently have {new_balance} {currency}."
+                ).format(
+                    author=author.mention,
+                    currency=adventure_credits_name,
+                    amount=humanize_number(amount),  # Make customizable?
+                    new_balance=humanize_number(await bank.get_balance(author)),
+                ),
             )
-            entries.append(data)
-            if pos % 10 == 0:
-                pages.append(box("\n".join(entries), lang="md"))
-                entries = [header]
-            elif account_number == pos:
-                pages.append(box("\n".join(entries), lang="md"))
-        return pages
+        try:
+            character = await Character.from_json(self.config, ctx.author, self._daily_bonus)
+        except Exception as exc:
+            log.exception("Error with the new character sheet", exc_info=exc)
+        else:
+            if character.last_currency_check + 600 < time.time() or character.bal > character.last_known_currency:
+                character.last_known_currency = await bank.get_balance(ctx.author)
+                character.last_currency_check = time.time()
+                await self.config.user(ctx.author).set(await character.to_json(self.config))
+
+    @commands.group(name="atransfer")
+    @has_separated_economy()
+    async def commands_atransfer(self, ctx: commands.Context):
+        """Transfer currency between players/economies."""
+
+    @commands_atransfer.command(name="deposit")
+    @commands.guild_only()
+    async def commands_atransfer_deposit(self, ctx: commands.Context, *, amount: int):
+        """Convert bank currency to gold."""
+        from_conversion_rate = await self.config.to_conversion_rate()
+        transferable_amount = amount * from_conversion_rate
+        if amount <= 0:
+            await smart_embed(
+                ctx, _("{author.mention} You can't deposit 0 or negative values.").format(author=ctx.author),
+            )
+            return
+        if not await bank.can_spend(ctx.author, amount=amount, _forced=True):
+            await smart_embed(
+                ctx,
+                _("{author.mention} You don't have enough {name}.").format(
+                    author=ctx.author, name=await bank.get_currency_name(ctx.guild, _forced=True)
+                ),
+            )
+            return
+        try:
+            await bank.withdraw_credits(member=ctx.author, amount=amount, _forced=True)
+        except ValueError:
+            await smart_embed(
+                ctx,
+                _("{author.mention} You don't have enough {name}.").format(
+                    author=ctx.author, name=await bank.get_currency_name(ctx.guild, _forced=True)
+                ),
+            )
+            return
+        try:
+            await bank.deposit_credits(member=ctx.author, amount=transferable_amount)
+        except BalanceTooHigh as exc:
+            await bank.set_balance(member=ctx.author, amount=exc.max_balance)
+        await smart_embed(
+            ctx,
+            _("{author.mention} you converted {amount} {currency} to {a_amount} {a_currency}.").format(
+                author=ctx.author,
+                amount=humanize_number(amount),
+                a_amount=humanize_number(transferable_amount),
+                a_currency=await bank.get_currency_name(ctx.guild),
+                currency=await bank.get_currency_name(ctx.guild, _forced=True),
+            ),
+        )
+        try:
+            character = await Character.from_json(self.config, ctx.author, self._daily_bonus)
+        except Exception as exc:
+            log.exception("Error with the new character sheet", exc_info=exc)
+        else:
+            if character.last_currency_check + 600 < time.time() or character.bal > character.last_known_currency:
+                character.last_known_currency = await bank.get_balance(ctx.author)
+                character.last_currency_check = time.time()
+                await self.config.user(ctx.author).set(await character.to_json(self.config))
+
+    @commands_atransfer.command(name="withdraw", cooldown_after_parsing=True)
+    @commands.guild_only()
+    @commands.cooldown(rate=1, per=600, type=commands.BucketType.user)
+    async def commands_atransfer_withdraw(self, ctx: commands.Context, *, amount: int):
+        """Convert gold to bank currency."""
+        if await bank.is_global(_forced=True):
+            global_config = await self.config.all()
+            can_withdraw = global_config["disallow_withdraw"]
+            max_allowed_withdraw = global_config["max_allowed_withdraw"]
+            is_global = True
+        else:
+            guild_config = await self.config.guild(ctx.guild).all()
+            can_withdraw = guild_config["disallow_withdraw"]
+            max_allowed_withdraw = guild_config["max_allowed_withdraw"]
+            is_global = False
+        if not can_withdraw or max_allowed_withdraw < 1:
+            if is_global:
+                string = _("{author.mention} my owner has disabled this option.")
+            else:
+                string = _("{author.mention} the admins of this server do not allow you to withdraw here.")
+            await smart_embed(
+                ctx, string.format(author=ctx.author),
+            )
+            return
+        if amount <= 0:
+            await smart_embed(
+                ctx, _("{author.mention} You can't withdraw 0 or negative values.").format(author=ctx.author),
+            )
+            return
+        configs = await self.config.all()
+        from_conversion_rate = configs.get("from_conversion_rate")
+        transferable_amount = amount // from_conversion_rate
+        if not await bank.can_spend(member=ctx.author, amount=amount):
+            return await smart_embed(
+                ctx,
+                _("{author.mention} you don't have enough {name}.").format(
+                    author=ctx.author, name=await bank.get_currency_name(ctx.guild)
+                ),
+            )
+        if transferable_amount > max_allowed_withdraw:
+            return await smart_embed(
+                ctx,
+                _("{author.mention} I can't allow you to transfer {amount} to {bank}.").format(
+                    author=ctx.author,
+                    amount=humanize_number(transferable_amount),
+                    bank=await bank.get_bank_name(ctx.guild),
+                ),
+            )
+        try:
+            await bank.deposit_credits(member=ctx.author, amount=transferable_amount, _forced=True)
+        except BalanceTooHigh as exc:
+            await bank.set_balance(ctx.author, exc.max_balance, _forced=True)
+        await bank.withdraw_credits(member=ctx.author, amount=amount)
+        await smart_embed(
+            ctx,
+            _("{author.mention} you converted {a_amount} {a_currency} to {amount} {currency}.").format(
+                author=ctx.author,
+                a_amount=humanize_number(amount),
+                amount=humanize_number(transferable_amount),
+                a_currency=await bank.get_currency_name(ctx.guild),
+                currency=await bank.get_currency_name(ctx.guild, _forced=True),
+            ),
+        )
+
+    @commands_atransfer.command(name="player", cooldown_after_parsing=True)
+    @commands.guild_only()
+    @commands.cooldown(rate=1, per=600, type=commands.BucketType.user)
+    async def commands_atransfer_player(self, ctx: commands.Context, amount: int, *, player: discord.User):
+        """Transfer gold to another player."""
+        if amount <= 0:
+            await smart_embed(
+                ctx, _("{author.mention} You can't transfer 0 or negative values.").format(author=ctx.author),
+            )
+            ctx.command.reset_cooldown(ctx)
+            return
+        currency = await bank.get_currency_name(ctx.guild)
+        if not await bank.can_spend(member=ctx.author, amount=amount):
+            ctx.command.reset_cooldown(ctx)
+            return await smart_embed(
+                ctx,
+                _("{author.mention} you don't have enough {name}.").format(
+                    author=ctx.author, name=await bank.get_currency_name(ctx.guild)
+                ),
+            )
+        tax = await self.config.tax_brackets.all()
+        highest = 0
+        for tax, percent in tax.items():
+            tax = int(tax)
+            if tax >= amount:
+                break
+            highest = percent
+
+        try:
+            transfered = await bank.transfer_credits(
+                from_=ctx.author, to=player, amount=amount, tax=highest
+            )  # Customizable Tax
+        except (ValueError, BalanceTooHigh) as e:
+            ctx.command.reset_cooldown(ctx)
+            return await ctx.send(str(e))
+
+        await ctx.send(
+            _(
+                "{user} transferred {num} {currency} to {other_user} (You have been taxed {tax:.2%}, total transfered: {transfered})"
+            ).format(
+                user=ctx.author.display_name,
+                num=humanize_number(amount),
+                currency=currency,
+                other_user=player.display_name,
+                tax=highest,
+                transfered=humanize_number(transfered),
+            )
+        )
+
+    @commands_atransfer.command(name="give")
+    @commands.is_owner()
+    async def commands_atransfer_give(self, ctx: commands.Context, amount: int, *players: discord.User):
+        """[Owner] Give gold to adventurers."""
+        if amount <= 0:
+            await smart_embed(
+                ctx, _("{author.mention} You can't give 0 or negative values.").format(author=ctx.author),
+            )
+            return
+        players_string = ""
+        for player in players:
+            try:
+                await bank.deposit_credits(member=player, amount=amount)
+                players_string += f"{player.display_name}\n"
+            except BalanceTooHigh as exc:
+                await bank.set_balance(member=player, amount=exc.max_balance)
+                players_string += f"{player.display_name}\n"
+
+        await smart_embed(
+            ctx,
+            _("{author.mention} I've given {amount} {name} to the following adventurers:\n\n{players}").format(
+                author=ctx.author,
+                amount=humanize_number(amount),
+                players=players_string,
+                name=await bank.get_currency_name(ctx.guild),
+            ),
+        )
+
+    @commands.command(name="mysets")
+    async def commands_mysets(self, ctx: commands.Context):
+        """Show your sets."""
+
+        try:
+            character = await Character.from_json(self.config, ctx.author, self._daily_bonus)
+        except Exception as exc:
+            log.exception("Error with the new character sheet", exc_info=exc)
+            return
+
+        sets = await character.get_set_count()
+        table = BeautifulTable(default_alignment=ALIGN_LEFT, maxwidth=500)
+        table.set_style(BeautifulTable.STYLE_RST)
+        table.columns.header = [
+            "Name",
+            "Unique Pieces",
+            "Unique Owned",
+        ]
+        msgs = []
+        for k, v in sets.items():
+            if len(str(table)) > 1500:
+                table.rows.sort("Name", reverse=False)
+                msgs.append(box(str(table) + f"\nPage {len(msgs) + 1}", lang="css"))
+                table = BeautifulTable(default_alignment=ALIGN_LEFT, maxwidth=500)
+                table.set_style(BeautifulTable.STYLE_RST)
+                table.columns.header = [
+                    "Name",
+                    "Unique Pieces",
+                    "Unique Owned",
+                ]
+            table.rows.append((k, f"{v[0]}", f" {v[1]}" if v[1] == v[0] else f"[{v[1]}]"))
+        table.rows.sort("Name", reverse=False)
+        msgs.append(box(str(table) + f"\nPage {len(msgs) + 1}", lang="css"))
+        await menu(ctx, msgs, DEFAULT_CONTROLS)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import discord
 from redbot.core.commands import commands
@@ -18,6 +18,9 @@ log = logging.getLogger("red.cogs.adventure.menus")
 class LeaderboardSource(menus.ListPageSource):
     def __init__(self, entries: List[Tuple[int, Dict]]):
         super().__init__(entries, per_page=10)
+
+    def is_paginating(self):
+        return True
 
     async def format_page(self, menu: menus.MenuPages, entries: List[Tuple[int, Dict]]):
         ctx = menu.ctx
@@ -88,6 +91,9 @@ class WeeklyScoreboardSource(menus.ListPageSource):
         super().__init__(entries, per_page=10)
         self._stat = stat or "wins"
 
+    def is_paginating(self):
+        return True
+
     async def format_page(self, menu: menus.MenuPages, entries: List[Tuple[int, Dict]]):
         ctx = menu.ctx
         stats_len = len(humanize_number(entries[0][1][self._stat])) + 3
@@ -145,6 +151,9 @@ class ScoreboardSource(WeeklyScoreboardSource):
         super().__init__(entries)
         self._stat = stat or "wins"
         self._legend = None
+
+    def is_paginating(self):
+        return True
 
     async def format_page(self, menu: menus.MenuPages, entries: List[Tuple[int, Dict]]):
         ctx = menu.ctx
@@ -214,6 +223,9 @@ class NVScoreboardSource(WeeklyScoreboardSource):
     def __init__(self, entries: List[Tuple[int, Dict]], stat: Optional[str] = None):
         super().__init__(entries)
 
+    def is_paginating(self):
+        return True
+
     async def format_page(self, menu: menus.MenuPages, entries: List[Tuple[int, Dict]]):
         ctx = menu.ctx
         loses_len = max(len(humanize_number(entries[0][1]["loses"])) + 3, 8)
@@ -262,11 +274,11 @@ class NVScoreboardSource(WeeklyScoreboardSource):
             gold__losses = humanize_number(account_data["gold__losses"])
 
             data = (
-                f"{f'{pos_str}.':{pos_len}}"
-                f"{wins:{win_len}}"
-                f"{loses:{loses_len}}"
-                f"{xp__earnings:{xp__len}}"
-                f"{gold__losses:{gold__len}}"
+                f"{f'{pos_str}.':{pos_len}} "
+                f"{wins:{win_len}} "
+                f"{loses:{loses_len}} "
+                f"{xp__earnings:{xp__len}} "
+                f"{gold__losses:{gold__len}} "
                 f"{username}"
             )
             players.append(data)
@@ -276,12 +288,26 @@ class NVScoreboardSource(WeeklyScoreboardSource):
         return msg
 
 
+class SimpleSource(menus.ListPageSource):
+    def __init__(self, entries: List[str, discord.Embed]):
+        super().__init__(entries, per_page=1)
+
+    def is_paginating(self):
+        return True
+
+    async def format_page(self, menu: menus.MenuPages, page: Union[str, discord.Embed]):
+        return page
+
+
 class EconomySource(menus.ListPageSource):
     def __init__(self, entries: List[Tuple[str, Dict[str, Any]]]):
         super().__init__(entries, per_page=10)
         self._total_balance_unified = None
         self._total_balance_sep = None
         self.author_position = None
+
+    def is_paginating(self):
+        return True
 
     async def format_page(self, menu: menus.MenuPages, entries: List[Tuple[str, Dict[str, Any]]]) -> discord.Embed:
         guild = menu.ctx.guild
@@ -381,6 +407,7 @@ class BaseMenu(menus.MenuPages, inherit_buttons=False):
             message=message,
             **kwargs,
         )
+        self.__tasks = self._Menu__tasks
 
     async def update(self, payload):
         """|coro|
@@ -405,6 +432,81 @@ class BaseMenu(menus.MenuPages, inherit_buttons=False):
                 await button(self, payload)
         except Exception as exc:
             log.debug("Ignored exception on reaction event", exc_info=exc)
+
+    async def start(self, ctx, *, channel=None, wait=False, page: int = 0):
+        """
+        Starts the interactive menu session.
+
+        Parameters
+        -----------
+        ctx: :class:`Context`
+            The invocation context to use.
+        channel: :class:`discord.abc.Messageable`
+            The messageable to send the message to. If not given
+            then it defaults to the channel in the context.
+        wait: :class:`bool`
+            Whether to wait until the menu is completed before
+            returning back to the caller.
+
+        Raises
+        -------
+        MenuError
+            An error happened when verifying permissions.
+        discord.HTTPException
+            Adding a reaction failed.
+        """
+
+        # Clear the buttons cache and re-compute if possible.
+        try:
+            del self.buttons
+        except AttributeError:
+            pass
+
+        self.bot = bot = ctx.bot
+        self.ctx = ctx
+        self._author_id = ctx.author.id
+        channel = channel or ctx.channel
+        is_guild = isinstance(channel, discord.abc.GuildChannel)
+        me = ctx.guild.me if is_guild else ctx.bot.user
+        permissions = channel.permissions_for(me)
+        self.__me = discord.Object(id=me.id)
+        self._verify_permissions(ctx, channel, permissions)
+        self._event.clear()
+        msg = self.message
+        if msg is None:
+            self.message = msg = await self.send_initial_message(ctx, channel, page=page)
+        if self.should_add_reactions():
+            # Start the task first so we can listen to reactions before doing anything
+            for task in self.__tasks:
+                task.cancel()
+            self.__tasks.clear()
+
+            self._running = True
+            self.__tasks.append(bot.loop.create_task(self._internal_loop()))
+
+            if self.should_add_reactions():
+
+                async def add_reactions_task():
+                    for emoji in self.buttons:
+                        await msg.add_reaction(emoji)
+
+                self.__tasks.append(bot.loop.create_task(add_reactions_task()))
+
+            if wait:
+                await self._event.wait()
+
+    async def send_initial_message(self, ctx: commands.Context, channel: discord.abc.Messageable, page: int = 0):
+        """
+
+        The default implementation of :meth:`Menu.send_initial_message`
+        for the interactive pagination session.
+
+        This implementation shows the first page of the source.
+        """
+        self.current_page = page
+        page = await self._source.get_page(page)
+        kwargs = await self._get_kwargs_from_page(page)
+        return await channel.send(**kwargs)
 
     async def show_checked_page(self, page_number: int) -> None:
         max_pages = self._source.get_max_pages()
@@ -734,3 +836,134 @@ class LeaderboardMenu(BaseMenu, inherit_buttons=False):
         """go to the last page"""
         # The call here is safe because it's guarded by skip_if
         await self.show_page(self._source.get_max_pages() - 1)
+
+
+class BackpackMenu(BaseMenu, inherit_buttons=False):
+    def __init__(
+        self,
+        source: menus.PageSource,
+        help_command: commands.Command,
+        clear_reactions_after: bool = True,
+        delete_message_after: bool = False,
+        timeout: int = 60,
+        message: discord.Message = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            source,
+            clear_reactions_after=clear_reactions_after,
+            delete_message_after=delete_message_after,
+            timeout=timeout,
+            message=message,
+            **kwargs,
+        )
+        self.__help_command = help_command
+
+    async def update(self, payload):
+        """|coro|
+
+        Updates the menu after an event has been received.
+
+        Parameters
+        -----------
+        payload: :class:`discord.RawReactionActionEvent`
+            The reaction event that triggered this update.
+        """
+        button = self.buttons[payload.emoji]
+        if not self._running:
+            return
+
+        try:
+            if button.lock:
+                async with self._lock:
+                    if self._running:
+                        await button(self, payload)
+            else:
+                await button(self, payload)
+        except Exception as exc:
+            log.debug("Ignored exception on reaction event", exc_info=exc)
+
+    async def show_checked_page(self, page_number: int) -> None:
+        max_pages = self._source.get_max_pages()
+        try:
+            if max_pages is None:
+                # If it doesn't give maximum pages, it cannot be checked
+                await self.show_page(page_number)
+            elif page_number >= max_pages:
+                await self.show_page(0)
+            elif page_number < 0:
+                await self.show_page(max_pages - 1)
+            elif max_pages > page_number >= 0:
+                await self.show_page(page_number)
+        except IndexError:
+            # An error happened that can be handled, so ignore it.
+            pass
+
+    def reaction_check(self, payload):
+        """Just extends the default reaction_check to use owner_ids"""
+        if payload.message_id != self.message.id:
+            return False
+        if payload.user_id not in (*self.bot.owner_ids, self._author_id):
+            return False
+        return payload.emoji in self.buttons
+
+    def _skip_single_arrows(self):
+        max_pages = self._source.get_max_pages()
+        if max_pages is None:
+            return True
+        return max_pages == 1
+
+    def _skip_double_triangle_buttons(self):
+        max_pages = self._source.get_max_pages()
+        if max_pages is None:
+            return True
+        return max_pages <= 2
+
+    @menus.button(
+        "\N{BLACK LEFT-POINTING TRIANGLE}\N{VARIATION SELECTOR-16}",
+        position=menus.First(1),
+        skip_if=_skip_single_arrows,
+    )
+    async def go_to_previous_page(self, payload):
+        """go to the previous page"""
+        await self.show_checked_page(self.current_page - 1)
+
+    @menus.button(
+        "\N{BLACK RIGHT-POINTING TRIANGLE}\N{VARIATION SELECTOR-16}",
+        position=menus.Last(0),
+        skip_if=_skip_single_arrows,
+    )
+    async def go_to_next_page(self, payload):
+        """go to the next page"""
+        await self.show_checked_page(self.current_page + 1)
+
+    @menus.button(
+        "\N{BLACK LEFT-POINTING DOUBLE TRIANGLE WITH VERTICAL BAR}\N{VARIATION SELECTOR-16}",
+        position=menus.First(0),
+        skip_if=_skip_double_triangle_buttons,
+    )
+    async def go_to_first_page(self, payload):
+        """go to the first page"""
+        await self.show_page(0)
+
+    @menus.button(
+        "\N{BLACK RIGHT-POINTING DOUBLE TRIANGLE WITH VERTICAL BAR}\N{VARIATION SELECTOR-16}",
+        position=menus.Last(1),
+        skip_if=_skip_double_triangle_buttons,
+    )
+    async def go_to_last_page(self, payload):
+        """go to the last page"""
+        # The call here is safe because it's guarded by skip_if
+        await self.show_page(self._source.get_max_pages() - 1)
+
+    @menus.button("\N{CROSS MARK}")
+    async def stop_pages(self, payload: discord.RawReactionActionEvent) -> None:
+        """stops the pagination session."""
+        self.stop()
+
+    @menus.button("\N{INFORMATION SOURCE}\N{VARIATION SELECTOR-16}")
+    async def send_help(self, payload: discord.RawReactionActionEvent) -> None:
+        """Sends help for the provided command."""
+        await self.ctx.send_help(self.__help_command)
+        self.delete_message_after = True
+        self.stop()
